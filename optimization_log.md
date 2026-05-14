@@ -1012,3 +1012,127 @@ Counts verified: 193,690,690 (kw5), 8,031,647,685 (kw6), 119,060,324
   hit ≤ 77 ms; we're at 80, so plan says skip. Re-evaluate if the above
   three pieces land enough additional gain to cross the 77 ms gate.
 
+---
+
+## Post-Phase-2 follow-up session (Intel Core Ultra 7 270K)
+
+Continuing the experiments after the Phase 0/1/2 commit (66bc9f3). Standing entry:
+80.06 / 80.57 ms min/median p5; ~4.15 s p6. PGO retrained.
+
+### E64 — SoA layout for the leaf buffer (KEPT, ~-1.5 ms p5 / ~-9 % p6)
+User suggestion. Replaced AoS `LeafBufEntry buf[256]` (each entry 64-byte
+cache-line padded, struct = {QBB cp, GameState cgs, uint8 _pad[31]}) with
+struct-of-arrays:
+
+```cpp
+alignas(64) QuadBitBoard bufCp[BUF_CAP];   //  8 KB, 32-byte stride
+GameState               bufGs[BUF_CAP];    //  256 B, 1-byte stride
+```
+
+Total stack footprint shrinks 16 KB → 8.25 KB. Two consecutive `bufCp[i]`
+entries are 32-byte apart, so any pair (i even) shares exactly one 64-byte
+cache line — countMovesPair reads both children's QBBs from a single line.
+GameState array is tiny (256 B = 4 lines) and reads/writes are amortized
+across many emits.
+
+Updated countMovesPair signature to `(QBB *posA, GameState *gsA, QBB *posB,
+GameState *gsB)` instead of `(LeafBufEntry *ea, LeafBufEntry *eb)`.
+
+PGO retrained.
+
+| Metric | Phase 2 (AoS) | SoA | Δ |
+|---|---|---|---|
+| p5 -nott min (20-run) | 80.06 ms | **78.40 ms** | **-1.66 ms (-2.1 %)** |
+| p5 -nott median (20-run) | 80.57 ms | 80.11 ms | -0.46 ms |
+| p6 -nott min (5-run) | ~4.15 s | **3.78 s** | **-0.37 s (-8.9 %)** |
+| p6 -nott median (5-run) | ~4.15 s | 3.80 s | -0.35 s (-8.4 %) |
+
+p6 win is much larger than p5 win — at scale, the smaller stack footprint +
+cache-line-aligned pair access pays off across the longer run. The 40-byte
+naturally-aligned variant was tried briefly (no pad) — neutral on min, so
+kept the 64-byte alignment for guaranteed pair-line-share.
+
+Counts ✓ on kw5/kw6/startpos6/pos3-7.
+
+### E65 — SIMD-derive across the pair (REVERTED, +4-6 %)
+Packed both children's bb[0..3] into __m128i lanes (using _mm_unpacklo_epi64 /
+_mm_unpackhi_epi64 after loading 16-byte halves of each QBB), did the 7
+derivation bitops via SSE2 (allPieces / allPawns / knights / bishopQueens /
+rookQueens / kings / blackPieces), then extracted to scalar GPRs via
+_mm_cvtsi128_si64 / _mm_extract_epi64 for downstream slider iteration and
+bitScan work.
+
+Result: p5 min 78.40 → **82.74 ms (+4.34 ms, +5.5 %)**; p6 min 3.78 →
+3.999 s (+5.8 %). Reverted.
+
+**Root cause:** 14 _mm_extract_epi64 calls (2 µops each on Lion Cove) plus
+the 4 unpack-shuffles dominate the savings from collapsing 7 bitops to SIMD
+form. Would only pay off if downstream consumers stayed in XMM — but bitScan,
+popcount, magic-IMUL all require GPR, so extraction is mandatory.
+
+The pre-experiment hypothesis (extract cost dominates) was correct.
+
+### E66 — SSE2 QBB clear in makeMoveTFromParent, retry (REVERTED, in-the-noise)
+E5 (pre-Phase-2 AMD/ARM64 sprint) found this regressed -2 %. Retried after SoA
+because the 32-byte-aligned bufCp output might change MSVC's auto-vec
+decisions. PGO retrained.
+
+| Metric | Scalar (4 ANDs) | SSE2 (2 SSE2 ANDs) | Δ |
+|---|---|---|---|
+| p5 -nott min | 78.40 ms | 77.93 ms | -0.47 ms (noise) |
+| p5 -nott median | 80.11 ms | 79.87 ms | -0.24 ms (noise) |
+| p6 -nott min | 3.78 s | 3.781 s | flat |
+| p6 -nott median | 3.80 s | 3.852 s | +1.4 % |
+
+Within noise on min but slightly worse on p6 median. The scalar 4 ANDs
+already dispatch across Lion Cove's 4 ALU ports; the SSE2 2-store form is
+store-port-bound (Lion Cove has 2 STA pipes vs 4 ALU ports). Reverted.
+
+### E67 — drop __declspec(noinline) on countMovesPair (REVERTED, neutral-to-slight-neg)
+Let PGO decide whether to inline countMovesPair. PGO retrained.
+
+| Metric | noinline | (no attr) | Δ |
+|---|---|---|---|
+| p5 -nott min | 78.40 ms | 78.42 ms | flat |
+| p5 -nott median | 80.11 ms | 80.81 ms | +0.7 ms (noise) |
+| p6 -nott min | 3.78 s | 3.83 s | +1.3 % |
+| p6 -nott median | 3.80 s | 3.90 s | +2.7 % |
+
+PGO kept it out-of-line anyway (it's a 14 KB body) but the codegen shifted
+slightly when the explicit attribute was absent — perhaps PGO inlined some
+cold tail call sites. Reverted to keep the explicit attribute.
+
+### Standing baseline after E64-E67 (PGO retrained, all reverts applied)
+- ST kiwipete perft 5 -nott: **78.30 ms min / 78.82 ms median / 82.24 ms max**
+- ST kiwipete perft 6 -nott: **3.791 s min / 3.814 s median / 3.843 s max**
+- vs Phase 2 entry (80.06 / 80.57): **-1.76 ms / -1.75 ms (-2.2 %)**
+- vs original session baseline (84.5 / 86.3): **-6.2 ms / -7.5 ms (-7.3 % / -8.7 %)**
+
+Counts verified ✓.
+
+### What's left (data-driven priorities)
+Post-SoA profile (perft 6, 52k samples):
+- countMovesPair<1>: **75.8 %** of total time
+  - findAttackedSquares×2: ~24.6 %
+  - countMovesFromDerived×2: ~35.6 % (4-way hasEP/hasCastle dispatch inlined)
+  - derive / findPinnedPieces / dispatch overhead: ~15.6 %
+- enumerateMoves<WHITE, FgmcCount2Processor>: 16.25 %
+  - inner emit loops (addCompactMove → makeMoveTFromParent + buffer write): 13 %
+- countMovesPair<0>: 3.98 %
+
+`-bench-leaf` measures countMovesDispatch at **16.17 ns/call** — the
+unbatched per-call cost. perft 5 effective per-child cost ≈ 14 ns
+(amortizes the 5-cycle call boundary across pair); so the slider work
+itself is roughly at the LD-latency floor of Lion Cove (~5 cycles per
+slider iter, ~12 ms total slider work in perft 5).
+
+Remaining accessible levers in decreasing upper-bound order:
+1. **Phase 4 (AVX2 isolated TU)** — only one with a meaningful upper bound
+   (~10 ms via AVX2 gather + 4-way batching). Significant engineering risk
+   from the AVX2 codegen cliff (E3: -60 % global, E42: PEXT slower than
+   MUL). Would need careful single-TU isolation. Multi-hour engineering.
+2. **Black magic bitboards** — ~88 KB Annuss table vs current 778 KB. Hot
+   subset (~20-30 entries per slider) might fit L1d better. Modest, ~2-5 ms.
+3. **Incremental threatened update across siblings** — plan v1/v3 reset by
+   pos2's slider density (<10 % fast-path hit rate). Probably blocked.
+

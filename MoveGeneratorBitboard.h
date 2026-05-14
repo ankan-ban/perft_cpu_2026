@@ -1327,45 +1327,41 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         }
     }
 
-    // Phase 1 buffered emit: one entry per child position, cache-line sized so each
-    // makeMoveTFromParent write doesn't false-share with the next entry's tail.
-    // Layout matches what the upcoming Phase 2 pair-wise SIMD flush wants (32-byte
-    // QBB at the top of the line, GameState in the trailing pad).
-    struct alignas(64) LeafBufEntry
-    {
-        QuadBitBoard cp;          // 32 bytes
-        GameState    cgs;         //  1 byte
-        uint8        _pad[31];    // pad to 64
-    };
-    static_assert(sizeof(LeafBufEntry) == 64, "LeafBufEntry must be one cache line");
-
     template <uint8 parentChance>
     struct FgmcCount2Processor
     {
-        // 256 entries × 64 B = 16 KB on the stack frame. Kiwipete typically
-        // produces <= ~80 emits per parent so 256 is comfortable headroom.
-        // Only one countTwoLevelSubtree frame is live at a time, so peak stack
-        // growth is bounded by this single buffer (plus ancestor recursion).
+        // Two-array (struct-of-arrays) buffer. bufCp[] holds the 32-byte
+        // QuadBitBoards 32-byte-aligned, contiguous, so two consecutive entries
+        // share exactly one 64-byte cache line (the pair-wise flush gets both
+        // children in one line fetch). bufGs[] is just 256 bytes of game state,
+        // tiny, separate to avoid wasting 31 bytes of pad after each cp.
+        //
+        // Total stack footprint: 8 KB cp + 256 B gs = ~8.25 KB. The previous
+        // 64-byte-aligned single AoS layout was 16 KB.
+        //
+        // Kiwipete typically produces <= ~80 emits per parent so 256 is
+        // comfortable headroom.
         static constexpr int BUF_CAP = 256;
 
         QuadBitBoard parent;
         GameState parentGs;
         int bufN;
-        LeafBufEntry buf[BUF_CAP];
+        alignas(64) QuadBitBoard bufCp[BUF_CAP];   //  8 KB (32-byte stride, 64-byte aligned base)
+        GameState               bufGs[BUF_CAP];    //  ~256 B (1 byte stride)
 
-        // Explicit ctor: leaves `buf[]` default-initialised (uninit) instead of
-        // value-init'ing the whole 16 KB at every countTwoLevelSubtree entry.
+        // Explicit ctor: leaves bufCp/bufGs default-initialised (uninit)
+        // instead of value-init'ing the whole 8 KB at every entry.
         CPU_FORCE_INLINE FgmcCount2Processor(const QuadBitBoard &p, const GameState &pgs) noexcept
             : parent(p), parentGs(pgs), bufN(0) {}
 
-        // emit just writes the child position into the next buffer slot; the
+        // emit writes the child position into the next buffer slot; the
         // legality-counting step happens in flush() after enumerateMoves returns.
         template <uint8 piece>
         CPU_FORCE_INLINE void emit(uint8 from, uint8 to, uint8 flags)
         {
-            LeafBufEntry &e = buf[bufN++];
-            QuadBitBoard *cp = &e.cp;
-            GameState    *cgs = &e.cgs;
+            int i = bufN++;
+            QuadBitBoard *cp  = &bufCp[i];
+            GameState    *cgs = &bufGs[i];
             CMove move(from, to, flags);
             if constexpr (piece == BISHOP)
             {
@@ -1400,11 +1396,11 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
             int i = 0;
             for (; i + 1 < bufN; i += 2)
             {
-                s += countMovesPair<leafChance>(&buf[i], &buf[i + 1]);
+                s += countMovesPair<leafChance>(&bufCp[i], &bufGs[i], &bufCp[i + 1], &bufGs[i + 1]);
             }
             if (i < bufN)
             {
-                s += countMovesDispatch<leafChance>(&buf[i].cp, &buf[i].cgs);
+                s += countMovesDispatch<leafChance>(&bufCp[i], &bufGs[i]);
             }
             return s;
         }
@@ -1920,10 +1916,16 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
     // child), and we don't want that inlined into flush()'s caller chain.
     template <uint8 chance>
     __declspec(noinline)
-    static uint64 countMovesPair(LeafBufEntry *ea, LeafBufEntry *eb)
+    static uint64 countMovesPair(QuadBitBoard *posA, GameState *gsA, QuadBitBoard *posB, GameState *gsB)
     {
-        QuadBitBoard *posA = &ea->cp;  GameState *gsA = &ea->cgs;
-        QuadBitBoard *posB = &eb->cp;  GameState *gsB = &eb->cgs;
+
+        // Scalar per-child derive. SIMD-derive across the pair was tried
+        // (E65): pack both children's bb planes into __m128i lanes, do 7
+        // SSE2 bitops, extract back to scalar for use in slider iteration.
+        // Result: +4.3 ms p5 / +5.8 % p6 regression. The 14 _mm_extract_epi64
+        // calls (~28 µops) + 4 unpacks dominate the savings from 7 collapsed
+        // bitops. Would only pay off if downstream consumers stay in XMM —
+        // which they can't (bitScan, popcount, magic IMUL all require GPR).
 
         // Derive A
         uint64 allPiecesA    = posA->bb[1] | posA->bb[2] | posA->bb[3];
@@ -2134,7 +2136,12 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         uint64 clearMask = ~(src | dst);
 
         // Scalar 4 ANDs pipeline well on ARM64's wide scalar issue — beats NEON
-        // 2-op version on Snapdragon X Oryon (measured: 0.142 vs 0.155).
+        // 2-op version on Snapdragon X Oryon (measured: 0.142 vs 0.155). On
+        // Intel Lion Cove an explicit __m128i (2 x 16B) variant was tried both
+        // pre-SoA (E5) and post-SoA (E64) — both in-the-noise: perft 5 min
+        // moved by <1 ms, perft 6 was flat-to-slightly-worse. Scalar wins
+        // because MSVC schedules the 4 independent ANDs across 4 ports, while
+        // the SSE2 version is store-port-bound on Lion Cove's 2 STA pipes.
         cp->bb[0] = parent->bb[0] & clearMask;
         cp->bb[1] = parent->bb[1] & clearMask;
         cp->bb[2] = parent->bb[2] & clearMask;
