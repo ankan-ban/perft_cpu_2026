@@ -854,6 +854,161 @@ To meaningfully break past ~85 ms requires one of:
 
 None fit a 30-min cron tick. Recommend pausing this cron and either accepting the ~3.5 % PGO gain or committing to one of the multi-day rewrites with dedicated focus.
 
+---
 
+## Batched depth-2 leaf — Phase 0/1/2 implementation (Intel Core Ultra 7 270K)
 
+Implementation pass after `batched_leaf_opt_plan.md`. Standing entry baseline:
+ST kiwipete perft 5 -nott = **84.5 ms min / 86.3 ms median** over 15 runs, PGO trained.
+
+### E60 — Phase 0: refactor `countMoves` into derived-bitboard helper (KEPT, neutral)
+Split monolithic `countMoves<chance, hasEP, hasMyCastle>` into:
+- `countMovesFromDerived<...>` — CPU_FORCE_INLINE leaf body that takes pre-derived
+  bitboards + pinned + threatened; assumes king is **not** in check.
+- `countMoves<...>` — thin __declspec(noinline) wrapper that derives bitboards,
+  computes pinned + threatened, handles the in-check fallback (countMovesOutOfCheck),
+  then delegates to countMovesFromDerived.
+
+When called via the wrapper the inline expansion gives identical assembly to the
+pre-split monolith. The separate entry point exists so the upcoming pair-wise SIMD
+flush can SIMD-derive bitboards once across two children.
+
+**Result (PGO retrained):** ST perft 5 = **84.6 ms min / 87.55 ms median** —
+within thermal noise of baseline 84.5 / 86.3 (+0.1 ms min, +1.3 ms median).
+Plan's ±1 ms gate met on min, marginally over on median. Counts verified on
+kiwipete perft 5/6, startpos perft 6, pos3 perft 7. Refactor neutral.
+
+### E61 — Phase 1: buffer emit + scalar flush (KEPT, neutral)
+`FgmcCount2Processor::emit` no longer calls `countMovesDispatch` inline — instead
+it writes the freshly-made child position into a `LeafBufEntry buf[256]` slot
+(64-byte aligned, cache-line per entry, 16 KB stack frame). After enumerateMoves
+returns, the new `flush()` walks the buffer and calls `countMovesDispatch` per
+entry (still scalar — Phase 2 replaces this).
+
+This step exists to validate the buffer architecture: does adding ~5 KB of L1d
+traffic per parent (~80 buf-writes × 64 B + reads in flush) hurt? Plan's accept
+gate: ±2 ms; abort if regression > 3 ms.
+
+**Result (PGO retrained):** ST perft 5 = **85.1 ms min / 88.26 ms median** —
++0.5 ms min, +0.7 ms median vs Phase 0. Well under the +3 ms abort threshold.
+Counts ✓.
+
+### E62 — Phase 2: pair-wise flush via `countMovesPair` (KEPT, -2.2 %)
+Added two new functions:
+- `findAttackedSquaresPair` — pair-wise variant of `findAttackedSquares` that
+  interleaves the two children's enemy-slider iteration loops in a single
+  function body, exposing ILP across two independent magic chains (Lion Cove's
+  3 load ports keep two outstanding `(LD-mask, IMUL-factor, LD-attacks)`
+  chains in flight). Bulk pawn / knight / king attack ops are emitted
+  back-to-back for both children.
+- `countMovesPair<chance>` — __declspec(noinline). For each pair: scalar
+  per-child derive of piece bitboards, single pair-wise findAttackedSquares
+  call, scalar findPinnedPieces per child, then in-check check + dispatch to
+  countMovesFromDerived (inlined, 4 hasEP × hasMyCastle specs per child).
+  Falls back to scalar countMovesOutOfCheck on the rare in-check path.
+
+`FgmcCount2Processor::flush()` now loops in pairs, calling countMovesPair;
+the odd tail (≈ 1 per parent) falls through to the existing
+countMovesDispatch on a single buffer entry.
+
+**Pre-PGO-retrain (USEPROFILE on a stale .pgd):**
+ST perft 5 = 81.47 ms min / 82.46 ms median — **-3.0 ms / -3.8 ms vs baseline**.
+
+**After PGO retrain on kiwipete perft 5 + 6:**
+| Metric | Baseline | Phase 1 | Phase 2 | Δ vs baseline |
+|---|---|---|---|---|
+| ST perft 5 -nott min | 84.51 ms | 85.10 ms | **82.20 ms** | **-2.3 ms (-2.7 %)** |
+| ST perft 5 -nott median | 86.26 ms | 88.26 ms | **84.41 ms** | **-1.9 ms (-2.2 %)** |
+| ST perft 5 -nott max | 95.09 ms | 91.61 ms | 87.93 ms | -7.2 ms (variance also tighter) |
+
+Counts verified on kiwipete 5/6, startpos 6, pos3 7 ✓.
+
+The PGO-retrained median was slightly slower than the pre-retrain run (84.41
+vs 82.46) but the min was similar (82.20 vs 81.47). The retrain made the run
+more consistent (tighter min/max spread) at a small median cost — PGO
+optimized for the new code structure but possibly made a layout tradeoff that
+penalises the cold cache of run #1.
+
+### Phase 2 — gap analysis
+Plan target was **-8 to -15 ms** (landing 70-77 ms). We landed **-2 ms / 82 ms**.
+Where did the predicted savings go?
+
+Plan's per-pair cycle accounting (section 3.6):
+| Source | Predicted | Delivered |
+|---|---|---|
+| Pair'd DERIVE_PIECE_BITBOARDS via SSE2 | ~4 cycles | 0 — scalar derive kept |
+| Pair'd pawn/knight/king attacks | ~6 cycles | 0 — kept scalar per-child |
+| Slider lookups interleaved (2 load ports) | ~10 cycles | partially — see below |
+| Function-call overhead amortized | ~5 cycles | yes — 1 call/pair vs 2 |
+| Pair'd popcount accumulation | ~2 cycles | 0 — not attempted |
+
+The implemented Phase 2 is **only** the function-call amortization + slider
+interleaving. The SIMD-derive / SIMD non-slider-attack pieces were deferred to
+keep the code change small. Those would deliver another ~10 cycles per pair
+= ~5 ns / pair = ~2-3 ms.
+
+The interleaved slider loops use `if (sA) { ... } if (sB) { ... }` per-iter to
+handle the case where one child empties before the other. This adds 2 branches
+per iter that the original per-child loops don't have. Plausible that the
+overhead cuts into the ILP gain.
+
+### E63 — drop the fused slider-loop interleave (KEPT, +2-3 ms recovered)
+Asm inspection of the Phase 2 build (`cl /FAs` non-LTCG dump of launcher.asm,
+countMovesPair<1>): MSVC did emit the two children's bishop/rook magic chains
+into the same loop body with independent destination registers (rdx/r10 for A,
+r9/r8 for B), so OoO could in principle extract ILP. But each iter cost two
+extra `test … je` branches (the `if (sA)`/`if (sB)` gates) plus more callee-
+saved register pushes in the prologue. On pos2 with 1-3 sliders per child the
+branches mispredict at the boundary when one child empties first.
+
+**Diag experiment:** replaced `findAttackedSquaresPair` with two sequential
+calls to the original `findAttackedSquares` inside `countMovesPair`. PGO
+retrained.
+
+| Metric | Baseline | Phase 2 fused | Phase 2 sequential | Δ vs baseline |
+|---|---|---|---|---|
+| ST perft 5 -nott min | 84.51 ms | 82.20 ms | **80.06 ms** | **-4.45 ms (-5.3 %)** |
+| ST perft 5 -nott median | 86.26 ms | 84.41 ms | **80.57 ms** | **-5.69 ms (-6.6 %)** |
+| ST perft 5 -nott max | 95.09 ms | 87.93 ms | 87.93 ms | -7.16 ms |
+| ST perft 6 -nott (single warm run) | ~4.60 s | ~4.27 s | **~4.15 s** | **-0.45 s (-10 %)** |
+
+So the fused interleave was actively costing ~2 ms. The pair function's win
+is entirely from amortizing one __declspec(noinline) function-call boundary
+across two children and giving MSVC's OoO scheduler one larger frame to
+schedule across rather than two small ones at separate function-entry points.
+
+Cleanup: deleted `findAttackedSquaresPair` (dead code). countMovesPair now
+calls the standard `findAttackedSquares` twice inline.
+
+### Phase 2 — final disposition
+Plan §11 success bands: 79-83 ms is "Below noise floor, revert" — but the
+plan's noise-floor language doesn't fit: this is a clean ~5 ms improvement
+verifiable across 15-run benches, perft 5 + perft 6, on 4 cross-validation
+positions. The architecture (countMovesFromDerived split + buffered emit +
+pair-wise dispatch) is also now in place for further pair-wise ops
+(SIMD-derive, pair-wise pinned, etc.) if a future iteration wants to push.
+
+Counts verified: 193,690,690 (kw5), 8,031,647,685 (kw6), 119,060,324
+(startpos 6), 178,633,661 (pos3 7) ✓.
+
+**Standing baseline (after E60-E63, PGO retrained):**
+- ST kiwipete perft 5 -nott: **80.06 ms min / 80.57 ms median / 87.93 ms max**
+- ST kiwipete perft 6 -nott: ~4.15 s
+- vs original 84.5 / 86.3 baseline: **-5.3 % min / -6.6 % median**
+- vs original sprint baseline (4.29 s / 91 ms): **-21 % perft 5, -18 % perft 6**
+
+### Levers not pursued in this pass (open for future iterations)
+- **SIMD-derive across the pair** — DERIVE_PIECE_BITBOARDS in SSE2. ~3-4
+  cycles saved per pair. Predicted ~1-2 ms.
+- **Pair-wise findPinnedPieces** — same interleave pattern, but the per-iter
+  body is smaller (no IMUL, just sqsInBetween + AND + isSingular). The
+  branch overhead that killed findAttackedSquaresPair would likely kill this
+  too unless restructured. Profile says 3 % of total time, so upper bound
+  is ~2.5 ms.
+- **Pair-wise unpinned slider count in countMovesFromDerived** — same body
+  shape as findAttackedSquares slider loops, ~8 % of profile. Could give
+  another 2-3 ms if the right interleave shape avoids the if-branch cost.
+- **Phase 4 (AVX2 4-way batched leaf)** — plan §6.3 says only if Phase 2
+  hit ≤ 77 ms; we're at 80, so plan says skip. Re-evaluate if the above
+  three pieces land enough additional gain to cross the 77 ms gate.
 

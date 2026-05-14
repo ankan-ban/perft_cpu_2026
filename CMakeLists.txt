@@ -24,18 +24,20 @@ if(MSVC)
     # /fp:fast: relax floating-point (no perft math depends on strict FP).
     # /GL + /LTCG omitted — they hung > 3 min on this heavily-templated codebase;
     # /Ob3 alone gives full per-TU inlining which is what the hot path needs.
-    target_compile_options(perft_cpu PRIVATE /O2 /Ob3 /Oi /Ot /fp:fast /Zi /GL)
-    target_link_options(perft_cpu PRIVATE /DEBUG /OPT:REF /OPT:ICF /LTCG /USEPROFILE)
+    if(PERFT_DUMP_ASM)
+        # /FAs emits per-TU asm dumps. Incompatible with /GL+/LTCG (which defers
+        # codegen to link time, leaving per-TU asm empty), so the asm-build
+        # config disables them. Used only for hot-path inspection.
+        target_compile_options(perft_cpu PRIVATE /O2 /Ob3 /Oi /Ot /fp:fast /Zi /FAs)
+        target_link_options(perft_cpu PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    else()
+        target_compile_options(perft_cpu PRIVATE /O2 /Ob3 /Oi /Ot /fp:fast /Zi /GL)
+        target_link_options(perft_cpu PRIVATE /DEBUG /OPT:REF /OPT:ICF /LTCG /USEPROFILE)
+    endif()
 
     # ARM64 needs an explicit arch hint to enable newer extensions (CNT, RBIT, etc.).
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
         target_compile_options(perft_cpu PRIVATE /arch:armv8.4)
-    endif()
-
-    # PERFT_DUMP_ASM=ON emits source-interleaved listings for hot-path inspection.
-    # Off by default — bloats build ~50×.
-    if(PERFT_DUMP_ASM)
-        target_compile_options(perft_cpu PRIVATE /FAs)
     endif()
 else()
     target_compile_options(perft_cpu PRIVATE -O3 -flto)
