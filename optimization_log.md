@@ -1136,3 +1136,111 @@ Remaining accessible levers in decreasing upper-bound order:
 3. **Incremental threatened update across siblings** — plan v1/v3 reset by
    pos2's slider density (<10 % fast-path hit rate). Probably blocked.
 
+
+---
+
+## Session E1-E12 — Claude exploratory sprint on AMD Ryzen 9 9950X3D (2026-05-14/15)
+
+A 12-experiment systematic exploration on top of the post-Phase-2 SoA branch.
+Standing entry: ~78.0 / 78.3 ms min/median p5 (E_BASE on this machine, PGO
+retrained). Only one experiment landed a kept win (E7).
+
+### E1 — Cache child's derived bitboards in emit() (REVERTED, -10%)
+Idea: in emit(), after makeMoveT, run DERIVE_PIECE_BITBOARDS on cp and store
+in a parallel `bufD[256]` (8 uint64 per slot, 16 KB total). countMovesPair
+reads pre-derived state, skips its own derive.
+Result: **86.3 ms (-10%)**. The 64-byte stores per emit × 4M emits added
+~10 ms of store-buffer pressure that exceeded the leaf-side savings. Total
+work was the SAME; just moved the derive from leaf to emit and the memory
+shape was worse.
+
+### E2 — /arch:AVX globally (REVERTED, mixed)
+Result: p5 77.85 (-1%), p6 4.13 s (+9.5% regression). VEX-128 encoding
+helps slightly on the leaf but perft 6 regresses under sustained load —
+probably register-allocation differences in the deeper recursion. Net
+negative.
+
+### E3 — Drop noinline on countMovesPair (REVERTED, stack overflow)
+Inlining countMovesPair into flush blew the default 1 MB stack during the
+5-deep recursion (each frame already 8 KB processor + inlined leaf body).
+STATUS_STACK_OVERFLOW at perft 5.
+
+### E5 — BUF_CAP = 128 (NEUTRAL)
+Halved per-sub-buffer cap from 256 → 128 (4 KB QBB instead of 8 KB).
+Kiwipete max ~80 moves/parent so safe. Within noise (~78 ms unchanged).
+
+### E7 — Cache parent's pawn|knight|king attacks for slider-move leaves (**KEPT, -3.4%**)
+**The winning idea.** For slider moves (BISHOP/ROOK/QUEEN), the parent's
+non-slider piece positions don't change, so the leaf's enemy
+pawn|knight|king attack contribution is identical to the parent's.
+
+- Added `findSliderAttacksOnly(emptySquares, enemyBishops, enemyRooks, myKing)`
+  helper — does only the slider portion of findAttackedSquares.
+- Added `cachedNonSliderAtk` field to FgmcCount2Processor (precomputed in
+  the constructor as `pawnAttacks | knightAttacks | kingAttacks` from
+  parent's chance perspective).
+- Split FgmcCount2Processor buffer: `bufCp_fast`/`bufGs_fast` for slider
+  moves (B/R/Q), `bufCp_slow`/`bufGs_slow` for everything else.
+- Added `countMovesPairCached<chance, recomputedPiece=0>` that uses the
+  cached non-slider attacks + `findSliderAttacksOnly` instead of full
+  `findAttackedSquares`.
+- emit dispatches by `constexpr piece` template; flush processes each
+  sub-buffer with its appropriate leaf path.
+
+**Result:** **75.20 ms min / 75.30 ms median** p5 — **-3.4 % vs E_BASE**.
+Counts verified 193,690,690 / 8,031,647,685. Profile attribution post-E7:
+countMovesPairCached + countMovesPair = 76% of CPU, sliders dominate.
+
+### E8 — Extend cache to PNK moves (4-way fast paths) (REVERTED, regressed)
+Cached `pawnAtk`/`knightAtk`/`kingAtk` separately, added pawn-fast,
+knight-fast, king-fast sub-buffers with `countMovesPairCached<chance,
+recomputedPiece>` templated on the moved piece type (so the leaf
+recomputes only that piece's attacks from leaf state).
+Result: **76.49 ms** vs E7's 75.30 — REGRESSED by +1.2 ms. Likely cause:
+4 specializations of countMovesPairCached blew the i-cache budget.
+
+### E8b — Slider + pawn fast paths only (NEUTRAL vs E7)
+Reduced E8 to just 2 specializations (slider + pawn). Result: 75.39 ms
+median vs E7's 75.30. Within noise.
+
+### E9 — Hoist leafMyKing to processor + pass as arg (NEUTRAL vs E7)
+leaf's myKing is invariant across the parent's enumeration (parent never
+moves its opponent's king). Precompute in constructor, pass as extra arg
+to countMovesPair[Cached].
+Result: 75.53 vs 75.30. Slight regression. The extra arg spilled to stack
+and the per-leaf load cost offset the saved derive.
+
+### E10 — Interleave A/B derives in source order (NEUTRAL vs E7)
+Wrote the 16 derive lines as `allA; allB; blackA; blackB; ...` instead of
+`{A's 8 lines}; {B's 8 lines}`. Result: 75.56 vs 75.30. MSVC's OoO was
+already pipelining the back-to-back form correctly.
+
+### E11 — Drop unused `kings` param from countMovesFromDerived (NEUTRAL)
+Cleanup: countMovesFromDerived takes `kings` but never uses it. Removed.
+Result: identical to E7. MSVC was already eliminating the dead param.
+Kept for code cleanliness.
+
+### E12 — Explicit __m128i SSE2 for paired A/B derives (REVERTED, -2 ms)
+Used `_mm256_set_epi64x`/`_mm_or_si128`/etc. to compute 8 derived bitboards
+for A and B simultaneously via SSE2, then extract.
+Result: **77.42 ms** — REGRESSED by 2 ms vs E7. Same as the documented
+QBB-clear SSE2 attempt: XMM pack/extract overhead exceeds 4-port scalar
+AND throughput on Zen 5.
+
+### Net session result
+E7 + drop-kings-param: **75.30 ms p5 median**, ~-3.4% vs E_BASE (78.0).
+Compose with the pre-existing SoA Phase 2 changes for a total **~17%
+improvement** vs the original 91.2 ms ARM/Snapdragon baseline mentioned
+in CLAUDE.md.
+
+### Follow-up plans documented (separate .md files)
+1. `plan_avx2_bulk_simd.md` — AVX2 isolated TU with 4-leaf SoA, cliff
+   amortized at parent level. Target ≤ 60 ms (-20% vs E7).
+2. `plan_make_unmake_incremental.md` — BoardState with incremental piece
+   bitboards, eliminating per-leaf DERIVE_PIECE_BITBOARDS. Target ≤ 55 ms.
+3. `plan_incremental_attack_maps.md` — incremental whiteAttacks/blackAttacks
+   maintained across make/unmake. Eliminates findAttackedSquares from the
+   leaf. Composes with plan 2. Combined target ≤ 50 ms.
+
+Each plan has phased implementation, decision gates, risk tables,
+validation strategy, and 3-4 week effort estimates.
