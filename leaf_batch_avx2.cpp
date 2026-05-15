@@ -19,7 +19,12 @@
 
 #include "chess.h"
 #include <stdint.h>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#define PERFT_HAS_AVX2 1
+#else
+#define PERFT_HAS_AVX2 0
+#endif
 
 // Helpers in launcher.cpp (default-arch TU, NOT /arch:AVX2). They do the
 // scalar pair-wise leaf loop using MoveGeneratorBitboard's templates.
@@ -37,6 +42,29 @@ extern "C" {
     uint64 leafSlowLoopScalarWithAtk4_black(QuadBitBoard *bufCp, GameState *bufGs,
                                             uint64 *enemyNonSliderAtk4, int n) noexcept;
 }
+
+#if !PERFT_HAS_AVX2
+// Non-x86 (ARM64, ARM64EC): no AVX2 — entry points forward straight to the
+// scalar helpers. The Phase 4 SIMD non-slider precompute is x86-only, so the
+// slow path here goes through the pre-Phase-4 scalar slow loop.
+extern "C" __declspec(noinline)
+uint64 countMovesBulkAVX2_fast_white(QuadBitBoard *bufCp, GameState *bufGs,
+                                     int n, uint64 cachedNonSliderAtk) noexcept
+{ return leafFastLoopScalar_white(bufCp, bufGs, n, cachedNonSliderAtk); }
+
+extern "C" __declspec(noinline)
+uint64 countMovesBulkAVX2_fast_black(QuadBitBoard *bufCp, GameState *bufGs,
+                                     int n, uint64 cachedNonSliderAtk) noexcept
+{ return leafFastLoopScalar_black(bufCp, bufGs, n, cachedNonSliderAtk); }
+
+extern "C" __declspec(noinline)
+uint64 countMovesBulkAVX2_slow_white(QuadBitBoard *bufCp, GameState *bufGs, int n) noexcept
+{ return leafSlowLoopScalar_white(bufCp, bufGs, n); }
+
+extern "C" __declspec(noinline)
+uint64 countMovesBulkAVX2_slow_black(QuadBitBoard *bufCp, GameState *bufGs, int n) noexcept
+{ return leafSlowLoopScalar_black(bufCp, bufGs, n); }
+#else
 
 // Phase 4: 4-lane SIMD computation of enemy non-slider attacks (pawn | knight
 // | king) for 4 child boards in parallel. Each lane = one child.
@@ -192,3 +220,4 @@ uint64 countMovesBulkAVX2_slow_black(QuadBitBoard *bufCp, GameState *bufGs, int 
 }
 
 }  // extern "C"
+#endif  // PERFT_HAS_AVX2

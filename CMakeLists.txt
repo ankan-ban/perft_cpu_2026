@@ -28,7 +28,7 @@ target_include_directories(perft_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # function entry, which is what amortizes the (small) save/restore cost
 # across many leaves. With /GL on, MSVC's LTCG would erase the boundary and
 # the per-TU /arch:AVX2 distinction would be meaningless.
-if(MSVC)
+if(MSVC AND (CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|X86|x86"))
     # cliff_probe stays /GL- (Phase 0 microbench needs a true non-inlinable call).
     set_source_files_properties(cliff_probe.cpp     PROPERTIES COMPILE_FLAGS "/arch:AVX2 /GL-")
     # leaf_batch_avx2 keeps /GL — under /GL- the linker picks the native COMDAT

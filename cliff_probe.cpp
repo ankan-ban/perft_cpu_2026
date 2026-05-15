@@ -19,7 +19,12 @@
 // ABI mangle-free and predictable across the TU boundary.
 
 #include <stdint.h>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#define PERFT_HAS_AVX2 1
+#else
+#define PERFT_HAS_AVX2 0
+#endif
 
 extern "C" __declspec(noinline)
 uint64_t cliff_probe_min(uint64_t *p)
@@ -27,6 +32,7 @@ uint64_t cliff_probe_min(uint64_t *p)
     return *p + 1u;
 }
 
+#if PERFT_HAS_AVX2
 extern "C" __declspec(noinline)
 uint64_t cliff_probe_4yc(uint64_t *p)
 {
@@ -64,3 +70,10 @@ uint64_t cliff_probe_16yc(uint64_t *p)
          + (uint64_t)_mm256_extract_epi64(acc, 2)
          + (uint64_t)_mm256_extract_epi64(acc, 3);
 }
+#else
+// Non-x86: stub the AVX2 microbench probes. They're only used by -bench-cliff,
+// which doesn't run on ARM. Returning *p keeps the call non-trivial so MSVC
+// can't fold it, matching the perf characteristic of cliff_probe_min.
+extern "C" __declspec(noinline) uint64_t cliff_probe_4yc (uint64_t *p) { return *p ^ 0x55aaULL; }
+extern "C" __declspec(noinline) uint64_t cliff_probe_16yc(uint64_t *p) { return *p ^ 0xaa55ULL; }
+#endif
