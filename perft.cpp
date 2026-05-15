@@ -49,7 +49,11 @@ static void samplerFunc()
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_CONTROL;
             if (GetThreadContext(g_targetThread, &ctx))
+#if defined(_M_ARM64)
+                g_samples.push_back((uintptr_t)ctx.Pc);
+#else
                 g_samples.push_back((uintptr_t)ctx.Rip);
+#endif
             ResumeThread(g_targetThread);
         }
         LARGE_INTEGER e;
