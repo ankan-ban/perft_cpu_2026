@@ -16,6 +16,112 @@
 #include "zobrist.h"
 #include "tt.h"
 
+// -------------------------------------------------------------------------
+// Plan A scalar leaf-batch helpers. These are extern "C" entry points called
+// from the AVX2-isolated TU (`leaf_batch_avx2.cpp`). They live HERE rather
+// than in the AVX2 TU so that the template instantiations of
+// countMovesPair[Cached] / countMovesDispatch from MoveGeneratorBitboard.h
+// land in a default-arch object. When the AVX2 TU was instantiating those
+// templates, LTCG merged the COMDAT under /arch:AVX2 codegen and every
+// caller paid the documented -57% global-AVX2 cliff (+~50 ms on kiwipete
+// perft 5). Keeping the AVX2 TU thin-forwarder-only preserves the cliff.
+// Phases 2+ will replace these forwarders with real SIMD work; that work
+// must reach the scalar leaf body via THIS interface, never by including
+// MoveGeneratorBitboard.h templates directly into the AVX2 TU.
+// -------------------------------------------------------------------------
+
+extern "C" {
+
+uint64 leafFastLoopScalar_white(QuadBitBoard *bufCp, GameState *bufGs,
+                                int n, uint64 cachedNonSliderAtk) noexcept
+{
+    uint64 s = 0;
+    int i = 0;
+    for (; i + 1 < n; i += 2) {
+        s += MoveGeneratorBitboard::countMovesPairCached<WHITE, 0>(
+            &bufCp[i], &bufGs[i], &bufCp[i + 1], &bufGs[i + 1], cachedNonSliderAtk);
+    }
+    if (i < n)
+        s += MoveGeneratorBitboard::countMovesDispatch<WHITE>(&bufCp[i], &bufGs[i]);
+    return s;
+}
+
+uint64 leafFastLoopScalar_black(QuadBitBoard *bufCp, GameState *bufGs,
+                                int n, uint64 cachedNonSliderAtk) noexcept
+{
+    uint64 s = 0;
+    int i = 0;
+    for (; i + 1 < n; i += 2) {
+        s += MoveGeneratorBitboard::countMovesPairCached<BLACK, 0>(
+            &bufCp[i], &bufGs[i], &bufCp[i + 1], &bufGs[i + 1], cachedNonSliderAtk);
+    }
+    if (i < n)
+        s += MoveGeneratorBitboard::countMovesDispatch<BLACK>(&bufCp[i], &bufGs[i]);
+    return s;
+}
+
+uint64 leafSlowLoopScalar_white(QuadBitBoard *bufCp, GameState *bufGs, int n) noexcept
+{
+    uint64 s = 0;
+    int i = 0;
+    for (; i + 1 < n; i += 2) {
+        s += MoveGeneratorBitboard::countMovesPair<WHITE>(
+            &bufCp[i], &bufGs[i], &bufCp[i + 1], &bufGs[i + 1]);
+    }
+    if (i < n)
+        s += MoveGeneratorBitboard::countMovesDispatch<WHITE>(&bufCp[i], &bufGs[i]);
+    return s;
+}
+
+uint64 leafSlowLoopScalar_black(QuadBitBoard *bufCp, GameState *bufGs, int n) noexcept
+{
+    uint64 s = 0;
+    int i = 0;
+    for (; i + 1 < n; i += 2) {
+        s += MoveGeneratorBitboard::countMovesPair<BLACK>(
+            &bufCp[i], &bufGs[i], &bufCp[i + 1], &bufGs[i + 1]);
+    }
+    if (i < n)
+        s += MoveGeneratorBitboard::countMovesDispatch<BLACK>(&bufCp[i], &bufGs[i]);
+    return s;
+}
+
+// Phase 4: scalar slow-path entry that consumes a precomputed per-child enemy
+// non-slider attack array (computed in the AVX2 TU via SIMD bulk shifts).
+// `n` is always 4 in the current caller, but we keep the generic shape for
+// future flexibility. Processes the 4 children as two pairs.
+uint64 leafSlowLoopScalarWithAtk4_white(QuadBitBoard *bufCp, GameState *bufGs,
+                                        uint64 *enemyNonSliderAtk4, int n) noexcept
+{
+    uint64 s = 0;
+    int i = 0;
+    for (; i + 1 < n; i += 2) {
+        s += MoveGeneratorBitboard::countMovesPairWithAtk<WHITE>(
+            &bufCp[i], &bufGs[i], &bufCp[i + 1], &bufGs[i + 1],
+            enemyNonSliderAtk4[i], enemyNonSliderAtk4[i + 1]);
+    }
+    if (i < n)
+        s += MoveGeneratorBitboard::countMovesDispatch<WHITE>(&bufCp[i], &bufGs[i]);
+    return s;
+}
+
+uint64 leafSlowLoopScalarWithAtk4_black(QuadBitBoard *bufCp, GameState *bufGs,
+                                        uint64 *enemyNonSliderAtk4, int n) noexcept
+{
+    uint64 s = 0;
+    int i = 0;
+    for (; i + 1 < n; i += 2) {
+        s += MoveGeneratorBitboard::countMovesPairWithAtk<BLACK>(
+            &bufCp[i], &bufGs[i], &bufCp[i + 1], &bufGs[i + 1],
+            enemyNonSliderAtk4[i], enemyNonSliderAtk4[i + 1]);
+    }
+    if (i < n)
+        s += MoveGeneratorBitboard::countMovesDispatch<BLACK>(&bufCp[i], &bufGs[i]);
+    return s;
+}
+
+}  // extern "C"
+
 // Runtime TT toggle (default: enabled, disable with -nott CLI flag)
 bool g_useTT = true;
 

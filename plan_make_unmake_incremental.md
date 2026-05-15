@@ -1,12 +1,37 @@
 # Plan B — Make/Unmake with Incremental Piece Bitboards
 
+**Updated 2026-05-15 after Plan A retrospective.**
+
 **Target:** push `kiwipete perft 5 -nott` single-thread on AMD Ryzen 9 9950X3D
-from **~75.3 ms** (post-E7 state) → **≤ 55 ms** (-27 %). Stretch: ≤ 50 ms.
+from **74.55 ms (post-Plan-A state)** → **≤ 55 ms** (-26 %). Stretch: ≤ 50 ms.
 
 **Conceptual goal:** eliminate per-leaf `DERIVE_PIECE_BITBOARDS` entirely.
 The leaf reads pre-derived bitboards directly. The cost (per-make-move
 update of derived state) is paid ONCE per move (depth-2 emit) instead of
 ONCE per leaf (depth-1 enter).
+
+**Why this plan is now the right next step.** Plan A (AVX2 isolated TU +
+4-lane SIMD) landed at -4.8 % p5 / -5.4 % p6 — well short of the ≤60 ms
+target. The post-mortem (see CLAUDE.md "Plan A retrospective" and
+`optimization_log.md` "Plan A — Phase 4" section) revealed two structural
+walls that Plan A's core lever cannot get past on Zen 5 + MSVC:
+
+1. **Marshaling cost across the cross-TU boundary** (~17 ms for 4 lanes of
+   derived state × 4 M leaves) **exceeds** the SIMD-derive savings
+   (~5-8 ms gross). The boundary is forced by Phase-1's hard rule that
+   the AVX2 TU cannot instantiate `MoveGeneratorBitboard.h` templates
+   without triggering the +50 ms global-AVX2 cliff (LTCG COMDAT merge).
+2. **Quad-wide (4-child) leaf bodies blow L1i** (E69 fast-path, E71
+   slow-path: both +2-2.5 ms regressions). `countMovesFromDerived` is
+   `__forceinline`; 4 inlined copies × 4 specializations × heavy slider
+   loops exceed the 32 KB i-cache on Zen 5.
+
+Plan B sidesteps **both** walls:
+- Derived state lives in `BoardState`, so no boundary marshaling — the
+  leaf reads pre-derived fields directly off the recursion-carried struct.
+- Sliding the per-leaf derive into the make/unmake path collapses the
+  per-leaf cost, so 4-wide processing (if pursued later) doesn't need to
+  fit 4 copies of derive-into-leaf body in i-cache at once.
 
 ---
 
@@ -50,11 +75,14 @@ high-volume but not novel.**
 
 ### 1.3 Standing measurement entering this plan
 
-- E7 state: 75.20 / 75.30 ms perft 5.
-- Profiler: countMovesPairCached + countMovesPair = 76 % of time. Inside
-  those, derives + leaf body share roughly equally.
-- Microbench countMovesDispatch: 14.33 ns / call. Of this, derive is
-  estimated ~2-3 ns based on the structure.
+- **Post-Plan-A state (2026-05-15):** kw perft 5 = **74.55 ms min / 74.99 ms median**,
+  kw perft 6 = **3.587 s min**. All 6 standard test positions pass.
+- Profiler (perft 6, 44k samples):
+  - `countMovesPairCached<1,0>` (fast / slider parent): 38.4 %
+  - `countMovesPairWithAtk<1>` (slow / PNK parent, Phase 4 SIMD non-slider): 30.8 %
+  - `enumerateMoves<0, FgmcCount2Processor<0>>`: 17.8 %
+- Microbench countMovesDispatch: ~14 ns / call. Derive portion estimated
+  at ~2-3 ns; eliminating it saves ~8-12 ms across the full perft 5.
 
 ### 1.4 What "make/unmake" means here
 
@@ -459,11 +487,15 @@ Replace `FgmcCount2Processor` with `FgmcCount2ProcessorIncr` that:
 - emit() applies `makeIncr`, stores child as `BoardState` not as `(QBB, GS)`.
 - flush() reads children directly — no more derive.
 
-Replace `countMovesPair` + `countMovesPairCached` with `countMovesPairIncr`
-that reads pre-derived state directly from each child `BoardState`.
+Replace `countMovesPair` + `countMovesPairCached` + `countMovesPairWithAtk`
+with `countMovesPairIncr` that reads pre-derived state directly from each
+child `BoardState`. Plan A's Phase 4 SIMD non-slider helper
+(`enemyNonSliderAtk4_impl` in `leaf_batch_avx2.cpp`) **composes here**:
+when the BoardState chain doesn't carry attack maps (Plan C territory),
+this SIMD helper still wins for the slow path. Don't delete it.
 
 **Decision gate:** kiwipete perft 5 = 193,690,690. Performance: at minimum
-no regression vs E7 (~75.3 ms); ideally ≤ 70 ms.
+no regression vs post-Plan-A (~74.5 ms); ideally ≤ 70 ms.
 
 ### Phase 8 — Eliminate redundant derives from leaf body (1-2 days)
 
@@ -680,22 +712,50 @@ makes the AVX2 TU simpler (it consumes BoardState arrays, not QBB+derive).
 
 ## 11. Pre-session checklist
 
-- [ ] Read `optimization_log.md`, especially E1 (where pre-derived state
-      regressed by 10 %). Understand why per-emit stores regressed — Plan B
-      avoids this because there are no per-emit stores; make/unmake mutates
-      ONE board, not buffers.
-- [ ] Verify E7 baseline: perft 5 = 75.20 ms min / 75.30 ms median.
-- [ ] Confirm counts at baseline for all 6 test positions.
-- [ ] Open `MoveGeneratorBitboard.h` at line 2120 (makeMoveTFromParent),
-      line 1672 (countMovesFromDerived), line 1418 (countTwoLevelSubtree).
+- [ ] Read `optimization_log.md`, especially:
+      - E1 (per-emit pre-derive cache regressed -10 %) — understand why
+        per-emit stores hurt; Plan B avoids this because make/unmake
+        mutates ONE board, not buffers.
+      - "Plan A — Phase 1" (the AVX2 cliff hard rule: do NOT instantiate
+        MoveGeneratorBitboard.h templates in the AVX2 TU). The Plan A
+        AVX2 TU + extern "C" forwarder layout in `leaf_batch_avx2.cpp` +
+        `launcher.cpp` is the substrate Plan B builds on.
+      - "Plan A — Phase 4" (Phase-4 `enemyNonSliderAtk4_impl` SIMD helper
+        is reusable for slow-path leaves under Plan B too, as long as
+        BoardState doesn't carry attack maps yet).
+      - E69 / E71 (quad-wide leaf bodies blow i-cache when
+        `countMovesFromDerived` is `__forceinline`). Plan B should
+        consider making `countMovesFromDerived` (or its
+        `…FromBoardState` equivalent) noinline / sliced before any 4-wide
+        try.
+- [ ] Verify post-Plan-A baseline: perft 5 = 74.55 ms min / 74.99 ms median;
+      perft 6 = 3.587 s min. Re-run via `cmake -DPERFT_PGO=GEN`, train,
+      merge, `-DPERFT_PGO=USE` (full cycle in `optimization_log.md`).
+- [ ] Confirm counts at baseline for all 6 standard test positions
+      (kw p5/p6, sp p6, pos3 p7, pos4 p5, pos5 p5).
+- [ ] Open `MoveGeneratorBitboard.h` at:
+      - line ~2592 (`makeMoveTFromParent`) — current emit-site copy-make.
+      - line ~1740 (`countMovesFromDerived`) — primary refactor target.
+      - line ~1482 (`countTwoLevelSubtree`) — recursion entry that needs
+        BoardState plumbing.
+      - line ~2540 (`countMovesPairWithAtk`) — Plan-A Phase-4 fallback
+        that the BoardState path can call through.
 - [ ] Decide on `BOARDSTATE_VERIFY` build mode and ensure CMake plumbing
-      is ready.
+      is ready (add `PERFT_BOARDSTATE_VERIFY=ON|OFF` cmake option, define
+      a `#define BOARDSTATE_VERIFY` in the BoardState header when enabled).
+- [ ] Confirm `cliff_probe.cpp` + `-bench-cliff` are still working — they
+      remain useful diagnostic tools if Plan B ends up reaching into the
+      AVX2 TU for SIMD ops on BoardState derived fields.
 
 When all check, begin Phase 0.
 
 ---
 
-*Plan written 2026-05-15. Building on E7's 3.4 % win and the 12-experiment
-exploration that established the scalar wall. Make/unmake is the
-historically-proven path used by Stockfish-class engines; the effort is
-large but the win is bounded by well-understood mechanics.*
+*Plan written 2026-05-15; updated same day after Plan A retrospective. Plan A
+delivered -4.8 % p5 / -5.4 % p6 (74.55 ms / 3.587 s) but its core lever
+(SoA 4-lane SIMD derive) is structurally blocked by AVX2-TU marshaling cost.
+Make/unmake is the historically-proven path used by Stockfish-class engines;
+the effort is large but the win is bounded by well-understood mechanics.
+The Plan A AVX2 TU + extern "C" forwarder architecture is preserved and
+provides a clean re-entry point for SIMD work on BoardState-derived state
+in the future.*

@@ -1,5 +1,12 @@
 # Plan C — Incremental Attack & Threat Maps
 
+> **2026-05-15.** Standing entry is now **74.55 ms p5 / 3.587 s p6**
+> (post-Plan-A). Plan C still depends on Plan B substrate
+> (`plan_make_unmake_incremental.md`); do Plan B first. Plan A's
+> `enemyNonSliderAtk4_impl` SIMD helper in `leaf_batch_avx2.cpp` can
+> coexist with this plan — it provides a fast slow-path before incremental
+> attack maintenance kicks in.
+
 **Target:** push `kiwipete perft 5 -nott` single-thread on AMD Ryzen 9 9950X3D
 from **~75.3 ms** (post-E7 state) → **≤ 60 ms** (-20 %). Stretch: ≤ 50 ms
 when combined with Plan B (make/unmake substrate).

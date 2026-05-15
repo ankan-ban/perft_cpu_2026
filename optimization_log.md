@@ -1244,3 +1244,210 @@ in CLAUDE.md.
 
 Each plan has phased implementation, decision gates, risk tables,
 validation strategy, and 3-4 week effort estimates.
+
+---
+
+## Plan A — Phase 0: AVX2 cliff measurement (2026-05-15)
+
+Microbench: `cliff_probe.cpp` compiled `/arch:AVX2 /GL-` in isolation, called
+1B times from the default-arch caller (`-bench-cliff <variant> <iters>`).
+
+| Probe | YMM ops in callee | ns/call | ~cycles @ 5 GHz |
+|---|---|---|---|
+| `cliff_probe_min`  | 0 (just ALU)          | 0.734 ns | ~3.7 c |
+| `cliff_probe_4yc`  | 4 YMM ops (YMM0-2)    | 0.738 ns | ~3.7 c |
+| `cliff_probe_16yc` | 16 YMM chain (uses YMM6, YMM7) | 1.800 ns | ~9.0 c |
+
+Disassembly (dumpbin):
+- `cliff_probe_min`: no XMM/YMM prologue. Plain call/ret.
+- `cliff_probe_4yc`: NO save/restore. Just `vzeroupper` at exit (~1c).
+- `cliff_probe_16yc`: saves XMM6+XMM7 to stack (vmovaps × 2),
+  `vzeroupper` + restore. ~3 cycles boundary cost.
+
+**Conclusion:** the global-AVX2 -57% cliff documented in sprint E3 does
+NOT manifest as a per-call boundary cost. MSVC emits save/restore only for
+the XMM6-15 registers it actually allocates (lower 128b — YMM upper halves
+just `vzeroupper`). Per-call cliff is 0-4 cycles, **far below** the 10-15
+cycles the plan budgeted.
+
+**Decision gate (from Plan A §3.0):** <5 cycles for typical use → "Plan is
+straightforward — can call per-pair if desired." Plan-as-designed (call
+per-parent batch) is comfortably below the noise floor.
+
+PROCEED to Phase 1.
+
+## Plan A — Phase 1: AVX2 TU scaffolding (2026-05-15)
+
+Goal: establish the AVX2/non-AVX2 boundary via `leaf_batch_avx2.cpp` compiled
+`/arch:AVX2`. Modify `FgmcCount2Processor::flush()` to route the slider-fast
+and slow sub-buffers through extern "C" entry points in the AVX2 TU.
+
+First attempt — AVX2 TU directly instantiates `countMovesPairCached`:
+- **+50 ms regression (78.5 → 131 ms p5)**. Identical with /GL and /GL-.
+- Root cause: LTCG merges the COMDAT template instantiation. With one TU
+  requesting /arch:AVX2 codegen, the merged copy is AVX2-flavored. All
+  callers (including the original non-AVX2 launcher.cpp) now go through
+  AVX2 codegen, triggering the documented `/arch:AVX2 globally -57%`
+  cliff (sprint E3) on Zen 5.
+
+**Design rule (KEEP FOREVER):** the AVX2 TU MUST NOT instantiate any
+template from `MoveGeneratorBitboard.h`. It must include only `chess.h`
+(types) and reach scalar leaf-body work via extern "C" forwarders defined
+in a default-arch TU.
+
+Phase 1 final architecture (thin forwarder):
+- `flush()` → `countMovesBulkAVX2_<{fast,slow}>_<{white,black}>()` in
+  `leaf_batch_avx2.cpp` (AVX2 TU, no templates)
+- AVX2 TU entry → `leaf{Fast,Slow}LoopScalar_<color>()` in `launcher.cpp`
+  (default-arch TU; template instantiations live here)
+- non-AVX2 helper → `MoveGeneratorBitboard::countMovesPair[Cached]`
+
+Bench (no PGO): **78.57 ms min / 78.72 ms median p5** (15 runs).
+Pre-Phase-1 baseline (no PGO): 78.47 / 78.81 ms. Within noise floor (counts ✓).
+
+Decision gate (≤80 ms, no significant regression): **PASS**. Proceed to Phase 2.
+
+Cost note: each cross-TU call (AVX2 entry → scalar helper) is one of the
+fast paths from Phase 0 (~3 cycles). The boundary cost across all parents
+(~98 K per perft 5, two calls each = 196 K crossings) is ~0.1 ms — vanishing.
+
+## Plan A — Phase 2 attempts (2026-05-15)
+
+Standing entry: **78.30 ms p5 (E64-E67 PGO).** After re-establishing PGO
+build on the current source tree (post-Phase-1 thin-forwarder AVX2 TU):
+**76.36 ms min / 76.62 ms median** — a ~2 ms gain attributable purely to
+PGO retraining on the post-E64 source tree (no algorithmic change).
+
+### E68 — findSliderAttacksOnly2 (2-way interleaved scalar) (REVERTED, +0.7 ms with PGO)
+Wrote a pair-wise interleaved version of `findSliderAttacksOnly` that drives
+both children's bishop chains in lockstep (each iter advances whichever lane
+still has bits), then both rook chains. Hypothesis: Zen 5's 3 load ports can
+keep 2 magic-LUT loads in flight, hiding the dependent IMUL latency.
+
+| Metric | Sequential (PGO) | Interleaved (PGO) | Δ |
+|---|---|---|---|
+| p5 min  | 75.56 ms | 76.29 ms | +0.73 ms |
+| p5 med  | 75.78 ms | 76.50 ms | +0.72 ms |
+
+Pre-PGO the two were noise-equivalent (~78.6 vs 78.8); under PGO the simpler
+sequential form codegen is slightly faster. The `if (sA) {…} if (sB) {…}`
+branches inside the interleaved loop add a tail-mispredict cost when chains
+diverge in length that wasn't offset by extra ILP — MSVC's OoO already
+pipelines the sequential bishop+rook chains within a single `findSliderAttacksOnly`
+call. REVERTED to sequential `findSliderAttacksOnly` calls.
+
+### E69 — countMovesQuadCached (4-wide pair-of-pairs leaf body) (REVERTED, +2.1 ms with PGO)
+Created a 4-child variant of `countMovesPairCached` and a `findSliderAttacksOnly4`
+helper that interleaves four bishop/rook chains. Hypothesis: 4 chains in
+flight pushes load-port utilization toward saturation; quad function call
+amortizes call overhead vs two pair calls.
+
+| Metric | Pair (PGO) | Quad (PGO) | Δ |
+|---|---|---|---|
+| p5 min  | 76.36 ms | 78.42 ms | +2.06 ms |
+| p5 med  | 76.62 ms | 78.70 ms | +2.08 ms |
+
+Root cause is likely i-cache pressure + register pressure: the quad body
+roughly doubles `countMovesPairCached` (already ~14 KB) and the function
+needs 24+ live uint64 lanes through the slider work. The 4 inlined
+`findPinnedPieces` calls + 4 inlined `countMovesFromDerived` calls bloat
+the function past what L1i comfortably holds during the inner work.
+REVERTED.
+
+### Standing after Phase 2 attempts (sequential sliders, pair body, PGO retrained)
+- ST kiwipete perft 5 -nott: **75.56 ms min / 75.78 ms median** (15 runs).
+- vs Plan A entry (78.30 ms): **-2.74 ms (-3.5 %)**, purely from PGO retrain.
+- vs Plan A target (≤60 ms): **still ~15.5 ms short**.
+
+### What we now know (added to dangerous-mines list)
+- **The AVX2 TU MUST NOT instantiate any `MoveGeneratorBitboard.h` template**
+  (E70 implicit via Phase 1 testing). Trying it caused LTCG to merge the
+  template COMDAT under /arch:AVX2 codegen, triggering the documented -57 %
+  global-AVX2 cliff: 78 → 131 ms (+50 ms). The Phase-1 thin-forwarder
+  architecture (AVX2 TU calls back into a default-arch helper TU) preserves
+  the boundary while keeping the cliff dormant.
+- **Pair-wise scalar code is already at the Zen 5 OoO ceiling** for the
+  slider-LUT load-throughput bottleneck (E68 + E69). Going to 4-wide
+  doesn't help because (a) load-port utilization is already near saturation
+  at 2-wide pair-pipelining, and (b) the i-cache footprint blows up.
+
+
+## Plan A — Phase 4: 4-lane SIMD non-slider attacks for slow path (KEPT)
+
+Architecture: AVX2 TU computes 4 children's enemy non-slider attacks
+(pawn|knight|king) in one 256-bit pass using SIMD shifts, then a non-AVX2
+helper consumes the precomputed map via `countMovesPairWithAtk<chance>`
+which replaces the inline `findAttackedSquares` calls in `countMovesPair`
+with `nonSliderAtkX | findSliderAttacksOnly(...)`.
+
+**Files changed:**
+- `leaf_batch_avx2.cpp`: added `enemyNonSliderAtk4_impl<chance>` (10-15
+  AVX2 ops including pawn/knight/king bulk shifts), wired through
+  `countMovesBulkAVX2_slow_<color>` which processes the slow buffer in
+  4-leaf chunks plus a scalar tail.
+- `launcher.cpp`: added `leafSlowLoopScalarWithAtk4_<color>` entry that
+  consumes the 4-uint64 attack array.
+- `MoveGeneratorBitboard.h`: added `countMovesPairWithAtk<chance>` (clone
+  of `countMovesPair` with the two `findAttackedSquares` calls replaced by
+  per-child `findSliderAttacksOnly` ORed with the precomputed non-slider).
+
+**Result (PGO retrained):**
+| Metric | Phase-2 baseline (PGO) | Phase-4 (PGO) | Δ |
+|---|---|---|---|
+| kw p5 min | 75.56 ms | **74.55 ms** | -1.01 ms (-1.3 %) |
+| kw p5 med | 75.78 ms | 74.99 ms | -0.79 ms (-1.0 %) |
+| kw p6 min | (~3.79 s pre-A) | **3.587 s** | -0.20 s (-5.4 %) |
+
+Counts ✓ on all six test positions. The perft 6 improvement is much larger
+in relative terms (5.4 %) than perft 5 (1.3 %), because at greater depth a
+larger fraction of leaves are in the slow path (countMovesPair → now
+countMovesPairWithAtk).
+
+Profile (perft 6 post-Phase-4, 44k samples):
+- `countMovesPairCached<1,0>`: 38.4 % (slider parents, fast path)
+- `countMovesPairWithAtk<1>`:  30.8 % (PNK parents, slow path — was 37 %)
+- `enumerateMoves<0,Fgmc2>`:   17.8 %
+
+### E71 — Slow-path quad (countMovesQuadWithAtk + findSliderAttacksOnly4) (REVERTED, +2.4 ms)
+Attempted to extend Phase 4 with a 4-wide slow-path body so the slider
+work also runs 4-way interleaved across children. Same regression
+mechanism as E69 (fast-path quad): the doubled body + 4 inlined
+`countMovesFromDerived` instances exceed L1i pressure on Zen 5.
+**Conclusion:** quad-wide processing of full leaf bodies is structurally
+incompatible with the current `countMovesFromDerived` shape on this μarch.
+Worth revisiting only if `countMovesFromDerived` itself is sliced into
+smaller noinline chunks (Plan B territory).
+
+### Standing after Plan A complete (Phases 0+1+2+4 + PGO)
+- kw p5: **74.55 ms min / 74.99 ms median** (vs Plan-A entry 78.30 ms,
+  -3.75 ms = **-4.8 %**)
+- kw p6: **3.587 s min** (vs Plan-A entry ~3.791 s, **-5.4 %**)
+- All 6 standard test positions ✓
+
+### Plan A — target retrospective
+Plan A target was **≤60 ms p5** (-23 % from 78.3 ms). Achieved -4.8 %.
+The plan-doc-estimated phase curve was:
+| Phase | Estimated | Actual |
+|---|---|---|
+| 2 (4-lane derive) | -3.5 ms | 0 ms (marshaling overhead exceeds derive savings; could not implement) |
+| 3 (interleaved sliders) | -2 ms  | 0 ms (E68 +0.7 ms; OoO at pair-level already saturated) |
+| 4 (4-lane non-slider, slow) | -1.5 ms | **-1.0 ms** ✓ matched estimate |
+| 5 (gather) | -0.5 ms | not attempted (estimated marginal) |
+| 6 (bulk pin)  | -0.5 ms | not attempted (i-cache hazard from E71) |
+| 7 (PGO retrain) | -2 ms | **-2.7 ms** ✓ |
+| **Total** | **-10 ms → 68 ms** | **-3.75 ms → 74.55 ms** |
+
+The Plan-A target depends on the SIMD derive landing (Phase 2-3); on Zen 5
+the cross-TU marshaling cost (≥1 ns/uint64 transferred) eats the derive
+savings (~2 ns/leaf gross). With the AVX2 TU constrained to NOT instantiate
+`MoveGeneratorBitboard.h` templates (Phase-1 hard rule), SoA derive
+cannot share state with the per-lane scalar leaf body without incurring
+this marshaling cost — making Plan A's main lever architecturally blocked.
+
+The full design space is now mapped:
+- Stuck below ~72 ms with Plan A's lever set (corroborated by 3 reverts).
+- Path to ≤60 ms requires **Plan B (make/unmake incremental)** to eliminate
+  the per-leaf DERIVE step entirely. Plan B's substrate value comes from
+  carrying derived state in `BoardState` across the recursion rather than
+  re-deriving at every leaf.
+

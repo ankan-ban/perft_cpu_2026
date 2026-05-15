@@ -1,5 +1,14 @@
 # Plan A — AVX2 Bulk-SIMD Leaf (4-wide structure-of-arrays)
 
+> **2026-05-15 — EXECUTED, partially successful.** Final result: 74.55 ms p5 / 3.587 s p6
+> (**-4.8 % / -5.4 %**), short of the ≤60 ms target. The core SoA 4-lane SIMD derive
+> lever was **structurally blocked** by cross-TU marshaling cost (the AVX2 TU cannot
+> instantiate `MoveGeneratorBitboard.h` templates without triggering the global-AVX2
+> cliff, so derived state must marshal across the boundary, which exceeds the SIMD
+> savings). See "Plan A retrospective" in `CLAUDE.md` and "Plan A — Phase 4" in
+> `optimization_log.md` for the post-mortem. Next session: see
+> `plan_make_unmake_incremental.md` (Plan B).
+
 **Target:** push `kiwipete perft 5 -nott` single-thread on AMD Ryzen 9 9950X3D
 from **~75.3 ms** (post-E7 state) → **≤ 60 ms** (-20 %). Stretch: ≤ 55 ms.
 

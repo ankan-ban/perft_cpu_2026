@@ -160,6 +160,28 @@ static uint64 benchLeafLoop(QuadBitBoard *pos, GameState *gs, int iters)
     return sum;
 }
 
+// Phase 0 cliff probe — defined in cliff_probe.cpp, compiled /arch:AVX2.
+extern "C" uint64 cliff_probe_min (uint64 *p);
+extern "C" uint64 cliff_probe_4yc (uint64 *p);
+extern "C" uint64 cliff_probe_16yc(uint64 *p);
+
+// Microbench for the AVX2 cross-TU cliff. Calls the chosen probe `iters`
+// times. The pointer `p` is forced volatile so MSVC can't hoist the call.
+__declspec(noinline)
+static uint64 benchCliffLoop(int variant, uint64 seed, int iters)
+{
+    uint64 sum = 0;
+    volatile uint64 v = seed;
+    uint64 *vp = (uint64 *)&v;
+    switch (variant) {
+        case 0: for (int j = 0; j < iters; j++) sum += cliff_probe_min (vp); break;
+        case 1: for (int j = 0; j < iters; j++) sum += cliff_probe_4yc (vp); break;
+        case 2: for (int j = 0; j < iters; j++) sum += cliff_probe_16yc(vp); break;
+        default: break;
+    }
+    return sum;
+}
+
 // Bench bishopAttacks and rookAttacks magic lookups in isolation.
 __declspec(noinline)
 static uint64 benchMagicLoop(uint64 occ, int iters)
@@ -195,6 +217,8 @@ int main(int argc, char *argv[])
 {
     int benchLeafIters  = 0;
     int benchMagicIters = 0;
+    int benchCliffIters = 0;
+    int benchCliffVariant = -1;
     bool doProfile      = false;
     for (int i = 1; i < argc; i++)
     {
@@ -231,6 +255,15 @@ int main(int argc, char *argv[])
             benchMagicIters = atoi(argv[i + 1]);
             for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
             argc -= 2; i--; continue;
+        }
+        if (strcmp(argv[i], "-bench-cliff") == 0 && i + 2 < argc)
+        {
+            // -bench-cliff <variant> <iters>
+            // variant: 0=min (no YMM), 1=4yc, 2=16yc
+            benchCliffVariant = atoi(argv[i + 1]);
+            benchCliffIters   = atoi(argv[i + 2]);
+            for (int j = i; j < argc - 3; j++) argv[j] = argv[j + 3];
+            argc -= 3; i--; continue;
         }
         if (strcmp(argv[i], "-profile") == 0)
         {
@@ -284,6 +317,23 @@ int main(int argc, char *argv[])
         double ns   = secs * 1e9 / benchLeafIters;
         printf("countMovesDispatch bench: %d iters, %.4f s, %.2f ns/call, sum=%llu\n",
             benchLeafIters, secs, ns, (unsigned long long)sum);
+        return 0;
+    }
+
+    if (benchCliffIters > 0 && benchCliffVariant >= 0)
+    {
+        Timer t;
+        // Warm-up to amortize page-faults / icache cold start.
+        (void)benchCliffLoop(benchCliffVariant, 0xdeadbeefULL, 1000);
+        t.start();
+        uint64 sum = benchCliffLoop(benchCliffVariant, 0xdeadbeefULL, benchCliffIters);
+        t.stop();
+        double secs = t.elapsed();
+        double ns   = secs * 1e9 / benchCliffIters;
+        const char *name = (benchCliffVariant == 0) ? "min"
+                         : (benchCliffVariant == 1) ? "4yc" : "16yc";
+        printf("cliff_probe_%s: %d iters, %.4f s, %.3f ns/call, sum=%llu\n",
+            name, benchCliffIters, secs, ns, (unsigned long long)sum);
         return 0;
     }
 

@@ -176,6 +176,18 @@ CPU_FORCE_INLINE uint64 sqBishopAttacks(uint8 sq)             { return BishopAtt
 CPU_FORCE_INLINE uint64 sqBishopAttacksMasked(uint8 sq)       { return BishopAttacksMasked[sq]; }
 CPU_FORCE_INLINE uint64 sqRookAttacksMasked  (uint8 sq)       { return RookAttacksMasked  [sq]; }
 
+// Plan A AVX2 leaf-batch entry points (defined in leaf_batch_avx2.cpp,
+// compiled /arch:AVX2 /GL- in isolation). Phase 1: stubs that loop the
+// scalar pair-wise leaf counter. Phases 2+ replace with SoA SIMD bodies.
+extern "C" {
+    uint64 countMovesBulkAVX2_fast_white(QuadBitBoard *bufCp, GameState *bufGs,
+                                         int n, uint64 cachedNonSliderAtk) noexcept;
+    uint64 countMovesBulkAVX2_fast_black(QuadBitBoard *bufCp, GameState *bufGs,
+                                         int n, uint64 cachedNonSliderAtk) noexcept;
+    uint64 countMovesBulkAVX2_slow_white(QuadBitBoard *bufCp, GameState *bufGs, int n) noexcept;
+    uint64 countMovesBulkAVX2_slow_black(QuadBitBoard *bufCp, GameState *bufGs, int n) noexcept;
+}
+
 class MoveGeneratorBitboard
 {
 public:
@@ -737,6 +749,153 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
             sliders &= sliders - 1;
         }
         return attacked;
+    }
+
+    // Pair-wise interleaved version of findSliderAttacksOnly. Iterates the two
+    // children's slider chains in lockstep so Zen 5's OoO can keep 2 magic-LUT
+    // loads in flight at once (3 load ports on this μarch). NOT CURRENTLY
+    // CALLED — sequential per-child `findSliderAttacksOnly` was faster under
+    // PGO (E68: +0.7 ms regression). Kept as reference for the 4-way variant.
+    static __forceinline void findSliderAttacksOnly2_UNUSED(
+        uint64 emptyA, uint64 bishopsA, uint64 rooksA, uint64 myKingA,
+        uint64 emptyB, uint64 bishopsB, uint64 rooksB, uint64 myKingB,
+        uint64 &outA, uint64 &outB)
+    {
+        uint64 sliderOccA = ~(emptyA | myKingA);
+        uint64 sliderOccB = ~(emptyB | myKingB);
+        uint64 atkA = 0, atkB = 0;
+
+        // Bishop chains, interleaved.
+        uint64 sA = bishopsA;
+        uint64 sB = bishopsB;
+        while (sA | sB)
+        {
+            if (sA) {
+                uint8  sq  = bitScan(sA);
+                uint64 occ = sliderOccA & sqBishopAttacksMasked(sq);
+                uint64 idx = (bishop_magic_factors[sq] * occ) >> (64 - BISHOP_MAGIC_BITS);
+                atkA |= bishop_magic_tables[sq][idx];
+                sA &= sA - 1;
+            }
+            if (sB) {
+                uint8  sq  = bitScan(sB);
+                uint64 occ = sliderOccB & sqBishopAttacksMasked(sq);
+                uint64 idx = (bishop_magic_factors[sq] * occ) >> (64 - BISHOP_MAGIC_BITS);
+                atkB |= bishop_magic_tables[sq][idx];
+                sB &= sB - 1;
+            }
+        }
+
+        // Rook chains, interleaved.
+        sA = rooksA;
+        sB = rooksB;
+        while (sA | sB)
+        {
+            if (sA) {
+                uint8  sq  = bitScan(sA);
+                uint64 occ = sliderOccA & sqRookAttacksMasked(sq);
+                uint64 idx = (rook_magic_factors[sq] * occ) >> (64 - ROOK_MAGIC_BITS);
+                atkA |= rook_magic_tables[sq][idx];
+                sA &= sA - 1;
+            }
+            if (sB) {
+                uint8  sq  = bitScan(sB);
+                uint64 occ = sliderOccB & sqRookAttacksMasked(sq);
+                uint64 idx = (rook_magic_factors[sq] * occ) >> (64 - ROOK_MAGIC_BITS);
+                atkB |= rook_magic_tables[sq][idx];
+                sB &= sB - 1;
+            }
+        }
+
+        outA = atkA;
+        outB = atkB;
+    }
+
+    // 4-lane interleaved variant. NOT CURRENTLY CALLED — slow-path quad was
+    // tried (E71) and regressed +2.4 ms vs Phase 4 pair-wise due to i-cache
+    // pressure from 4 inlined countMovesFromDerived bodies.
+    static __forceinline void findSliderAttacksOnly4_UNUSED(
+        uint64 emptyA, uint64 bishopsA, uint64 rooksA, uint64 myKingA,
+        uint64 emptyB, uint64 bishopsB, uint64 rooksB, uint64 myKingB,
+        uint64 emptyC, uint64 bishopsC, uint64 rooksC, uint64 myKingC,
+        uint64 emptyD, uint64 bishopsD, uint64 rooksD, uint64 myKingD,
+        uint64 &outA, uint64 &outB, uint64 &outC, uint64 &outD)
+    {
+        uint64 occA = ~(emptyA | myKingA);
+        uint64 occB = ~(emptyB | myKingB);
+        uint64 occC = ~(emptyC | myKingC);
+        uint64 occD = ~(emptyD | myKingD);
+        uint64 atkA = 0, atkB = 0, atkC = 0, atkD = 0;
+
+        // Bishop chains, 4-way interleaved.
+        uint64 sA = bishopsA, sB = bishopsB, sC = bishopsC, sD = bishopsD;
+        while (sA | sB | sC | sD)
+        {
+            if (sA) {
+                uint8  sq  = bitScan(sA);
+                uint64 occ = occA & sqBishopAttacksMasked(sq);
+                uint64 idx = (bishop_magic_factors[sq] * occ) >> (64 - BISHOP_MAGIC_BITS);
+                atkA |= bishop_magic_tables[sq][idx];
+                sA &= sA - 1;
+            }
+            if (sB) {
+                uint8  sq  = bitScan(sB);
+                uint64 occ = occB & sqBishopAttacksMasked(sq);
+                uint64 idx = (bishop_magic_factors[sq] * occ) >> (64 - BISHOP_MAGIC_BITS);
+                atkB |= bishop_magic_tables[sq][idx];
+                sB &= sB - 1;
+            }
+            if (sC) {
+                uint8  sq  = bitScan(sC);
+                uint64 occ = occC & sqBishopAttacksMasked(sq);
+                uint64 idx = (bishop_magic_factors[sq] * occ) >> (64 - BISHOP_MAGIC_BITS);
+                atkC |= bishop_magic_tables[sq][idx];
+                sC &= sC - 1;
+            }
+            if (sD) {
+                uint8  sq  = bitScan(sD);
+                uint64 occ = occD & sqBishopAttacksMasked(sq);
+                uint64 idx = (bishop_magic_factors[sq] * occ) >> (64 - BISHOP_MAGIC_BITS);
+                atkD |= bishop_magic_tables[sq][idx];
+                sD &= sD - 1;
+            }
+        }
+
+        // Rook chains, 4-way interleaved.
+        sA = rooksA; sB = rooksB; sC = rooksC; sD = rooksD;
+        while (sA | sB | sC | sD)
+        {
+            if (sA) {
+                uint8  sq  = bitScan(sA);
+                uint64 occ = occA & sqRookAttacksMasked(sq);
+                uint64 idx = (rook_magic_factors[sq] * occ) >> (64 - ROOK_MAGIC_BITS);
+                atkA |= rook_magic_tables[sq][idx];
+                sA &= sA - 1;
+            }
+            if (sB) {
+                uint8  sq  = bitScan(sB);
+                uint64 occ = occB & sqRookAttacksMasked(sq);
+                uint64 idx = (rook_magic_factors[sq] * occ) >> (64 - ROOK_MAGIC_BITS);
+                atkB |= rook_magic_tables[sq][idx];
+                sB &= sB - 1;
+            }
+            if (sC) {
+                uint8  sq  = bitScan(sC);
+                uint64 occ = occC & sqRookAttacksMasked(sq);
+                uint64 idx = (rook_magic_factors[sq] * occ) >> (64 - ROOK_MAGIC_BITS);
+                atkC |= rook_magic_tables[sq][idx];
+                sC &= sC - 1;
+            }
+            if (sD) {
+                uint8  sq  = bitScan(sD);
+                uint64 occ = occD & sqRookAttacksMasked(sq);
+                uint64 idx = (rook_magic_factors[sq] * occ) >> (64 - ROOK_MAGIC_BITS);
+                atkD |= rook_magic_tables[sq][idx];
+                sD &= sD - 1;
+            }
+        }
+
+        outA = atkA; outB = atkB; outC = atkC; outD = atkD;
     }
 
     // returns bitmask of squares in threat by enemy pieces
@@ -1450,19 +1609,13 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         {
             constexpr uint8 leafChance = (uint8)(parentChance ^ 1);
             uint64 s = 0;
-            int i = 0;
-            for (; i + 1 < bufN_fast; i += 2)
-                s += countMovesPairCached<leafChance, 0>(
-                    &bufCp_fast[i], &bufGs_fast[i],
-                    &bufCp_fast[i + 1], &bufGs_fast[i + 1], cachedNonSliderAtk);
-            if (i < bufN_fast)
-                s += countMovesDispatch<leafChance>(&bufCp_fast[i], &bufGs_fast[i]);
-            i = 0;
-            for (; i + 1 < bufN_slow; i += 2)
-                s += countMovesPair<leafChance>(&bufCp_slow[i], &bufGs_slow[i],
-                                                &bufCp_slow[i + 1], &bufGs_slow[i + 1]);
-            if (i < bufN_slow)
-                s += countMovesDispatch<leafChance>(&bufCp_slow[i], &bufGs_slow[i]);
+            if constexpr (leafChance == WHITE) {
+                s += countMovesBulkAVX2_fast_white(bufCp_fast, bufGs_fast, bufN_fast, cachedNonSliderAtk);
+                s += countMovesBulkAVX2_slow_white(bufCp_slow, bufGs_slow, bufN_slow);
+            } else {
+                s += countMovesBulkAVX2_fast_black(bufCp_fast, bufGs_fast, bufN_fast, cachedNonSliderAtk);
+                s += countMovesBulkAVX2_slow_black(bufCp_slow, bufGs_slow, bufN_slow);
+            }
             return s;
         }
     };
@@ -2103,6 +2256,131 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         return sum;
     }
 
+    // 4-wide quad version. NOT CALLED — fast-path quad regressed +2 ms with PGO
+    // (E69: i-cache pressure + register pressure with 24+ live uint64 lanes).
+    // Slow-path quad also regressed (E71). Retained as dead reference.
+    template <uint8 chance>
+    __declspec(noinline)
+    static uint64 countMovesQuadCached_UNUSED(
+        QuadBitBoard *posA, GameState *gsA,
+        QuadBitBoard *posB, GameState *gsB,
+        QuadBitBoard *posC, GameState *gsC,
+        QuadBitBoard *posD, GameState *gsD,
+        uint64 cachedNonSliderAtk)
+    {
+        // 4 derives. Stays scalar — SIMD-paired derive was tried (E12) and
+        // regressed -2 ms due to XMM pack/extract overhead vs 4-port scalar.
+        uint64 allPiecesA    = posA->bb[1] | posA->bb[2] | posA->bb[3];
+        uint64 allPiecesB    = posB->bb[1] | posB->bb[2] | posB->bb[3];
+        uint64 allPiecesC    = posC->bb[1] | posC->bb[2] | posC->bb[3];
+        uint64 allPiecesD    = posD->bb[1] | posD->bb[2] | posD->bb[3];
+        uint64 blackPiecesA  = posA->bb[0];
+        uint64 blackPiecesB  = posB->bb[0];
+        uint64 blackPiecesC  = posC->bb[0];
+        uint64 blackPiecesD  = posD->bb[0];
+        uint64 allPawnsA     = posA->bb[1] & ~posA->bb[2] & ~posA->bb[3];
+        uint64 allPawnsB     = posB->bb[1] & ~posB->bb[2] & ~posB->bb[3];
+        uint64 allPawnsC     = posC->bb[1] & ~posC->bb[2] & ~posC->bb[3];
+        uint64 allPawnsD     = posD->bb[1] & ~posD->bb[2] & ~posD->bb[3];
+        uint64 knightsA      = posA->bb[2] & ~posA->bb[1] & ~posA->bb[3];
+        uint64 knightsB      = posB->bb[2] & ~posB->bb[1] & ~posB->bb[3];
+        uint64 knightsC      = posC->bb[2] & ~posC->bb[1] & ~posC->bb[3];
+        uint64 knightsD      = posD->bb[2] & ~posD->bb[1] & ~posD->bb[3];
+        uint64 bishopQueensA = posA->bb[1] & (posA->bb[2] ^ posA->bb[3]);
+        uint64 bishopQueensB = posB->bb[1] & (posB->bb[2] ^ posB->bb[3]);
+        uint64 bishopQueensC = posC->bb[1] & (posC->bb[2] ^ posC->bb[3]);
+        uint64 bishopQueensD = posD->bb[1] & (posD->bb[2] ^ posD->bb[3]);
+        uint64 rookQueensA   = posA->bb[3] & ~posA->bb[2];
+        uint64 rookQueensB   = posB->bb[3] & ~posB->bb[2];
+        uint64 rookQueensC   = posC->bb[3] & ~posC->bb[2];
+        uint64 rookQueensD   = posD->bb[3] & ~posD->bb[2];
+        uint64 kingsA        = posA->bb[2] & posA->bb[3] & ~posA->bb[1];
+        uint64 kingsB        = posB->bb[2] & posB->bb[3] & ~posB->bb[1];
+        uint64 kingsC        = posC->bb[2] & posC->bb[3] & ~posC->bb[1];
+        uint64 kingsD        = posD->bb[2] & posD->bb[3] & ~posD->bb[1];
+        uint64 whitePiecesA = allPiecesA & ~blackPiecesA;
+        uint64 whitePiecesB = allPiecesB & ~blackPiecesB;
+        uint64 whitePiecesC = allPiecesC & ~blackPiecesC;
+        uint64 whitePiecesD = allPiecesD & ~blackPiecesD;
+
+        uint64 myPiecesA    = (chance == WHITE) ? whitePiecesA : blackPiecesA;
+        uint64 enemyPiecesA = (chance == WHITE) ? blackPiecesA : whitePiecesA;
+        uint64 myPiecesB    = (chance == WHITE) ? whitePiecesB : blackPiecesB;
+        uint64 enemyPiecesB = (chance == WHITE) ? blackPiecesB : whitePiecesB;
+        uint64 myPiecesC    = (chance == WHITE) ? whitePiecesC : blackPiecesC;
+        uint64 enemyPiecesC = (chance == WHITE) ? blackPiecesC : whitePiecesC;
+        uint64 myPiecesD    = (chance == WHITE) ? whitePiecesD : blackPiecesD;
+        uint64 enemyPiecesD = (chance == WHITE) ? blackPiecesD : whitePiecesD;
+
+        uint64 enemyBishopsA = bishopQueensA & enemyPiecesA;
+        uint64 enemyRooksA   = rookQueensA   & enemyPiecesA;
+        uint64 enemyBishopsB = bishopQueensB & enemyPiecesB;
+        uint64 enemyRooksB   = rookQueensB   & enemyPiecesB;
+        uint64 enemyBishopsC = bishopQueensC & enemyPiecesC;
+        uint64 enemyRooksC   = rookQueensC   & enemyPiecesC;
+        uint64 enemyBishopsD = bishopQueensD & enemyPiecesD;
+        uint64 enemyRooksD   = rookQueensD   & enemyPiecesD;
+
+        uint64 myKingA = kingsA & myPiecesA;
+        uint64 myKingB = kingsB & myPiecesB;
+        uint64 myKingC = kingsC & myPiecesC;
+        uint64 myKingD = kingsD & myPiecesD;
+        __assume(myKingA != 0); __assume((myKingA & (myKingA - 1)) == 0);
+        __assume(myKingB != 0); __assume((myKingB & (myKingB - 1)) == 0);
+        __assume(myKingC != 0); __assume((myKingC & (myKingC - 1)) == 0);
+        __assume(myKingD != 0); __assume((myKingD & (myKingD - 1)) == 0);
+        uint8 kingIndexA = bitScan(myKingA);
+        uint8 kingIndexB = bitScan(myKingB);
+        uint8 kingIndexC = bitScan(myKingC);
+        uint8 kingIndexD = bitScan(myKingD);
+
+        uint64 sliderAtkA, sliderAtkB, sliderAtkC, sliderAtkD;
+        findSliderAttacksOnly4(
+            ~allPiecesA, enemyBishopsA, enemyRooksA, myKingA,
+            ~allPiecesB, enemyBishopsB, enemyRooksB, myKingB,
+            ~allPiecesC, enemyBishopsC, enemyRooksC, myKingC,
+            ~allPiecesD, enemyBishopsD, enemyRooksD, myKingD,
+            sliderAtkA, sliderAtkB, sliderAtkC, sliderAtkD);
+
+        uint64 threatA = cachedNonSliderAtk | sliderAtkA;
+        uint64 threatB = cachedNonSliderAtk | sliderAtkB;
+        uint64 threatC = cachedNonSliderAtk | sliderAtkC;
+        uint64 threatD = cachedNonSliderAtk | sliderAtkD;
+
+        uint64 pinnedA = findPinnedPieces(myKingA, myPiecesA, enemyBishopsA, enemyRooksA, allPiecesA, kingIndexA);
+        uint64 pinnedB = findPinnedPieces(myKingB, myPiecesB, enemyBishopsB, enemyRooksB, allPiecesB, kingIndexB);
+        uint64 pinnedC = findPinnedPieces(myKingC, myPiecesC, enemyBishopsC, enemyRooksC, allPiecesC, kingIndexC);
+        uint64 pinnedD = findPinnedPieces(myKingD, myPiecesD, enemyBishopsD, enemyRooksD, allPiecesD, kingIndexD);
+
+        uint64 sum = 0;
+
+        #define QC_DISPATCH_LANE(L) do { \
+            if (threat##L & myKing##L) [[unlikely]] { \
+                sum += countMovesOutOfCheck<chance>(pos##L, gs##L, allPawns##L, allPieces##L, myPieces##L, enemyPieces##L, \
+                                                    pinned##L, threat##L, kingIndex##L, \
+                                                    knights##L, bishopQueens##L, rookQueens##L, kings##L); \
+            } else { \
+                bool hasEP = gs##L->enPassent != 0; \
+                bool hasCastle = (chance == WHITE) ? (gs##L->whiteCastle != 0) : (gs##L->blackCastle != 0); \
+                if (!hasEP) { \
+                    if (hasCastle) sum += countMovesFromDerived<chance, false, true >(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                    else           sum += countMovesFromDerived<chance, false, false>(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                } else { \
+                    if (hasCastle) sum += countMovesFromDerived<chance, true,  true >(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                    else           sum += countMovesFromDerived<chance, true,  false>(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                } \
+            } \
+        } while (0)
+
+        QC_DISPATCH_LANE(A);
+        QC_DISPATCH_LANE(B);
+        QC_DISPATCH_LANE(C);
+        QC_DISPATCH_LANE(D);
+        #undef QC_DISPATCH_LANE
+
+        return sum;
+    }
+
     template <uint8 chance>
     __declspec(noinline)
     static uint64 countMovesPair(QuadBitBoard *posA, GameState *gsA, QuadBitBoard *posB, GameState *gsB)
@@ -2204,6 +2482,232 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
                 }
             }
         }
+        return sum;
+    }
+
+    // Phase 4: slow-path pair variant that takes pre-computed per-child enemy
+    // non-slider attacks (pawn|knight|king) from the AVX2 SIMD batch helper.
+    // Body is `countMovesPair` minus the inline `findAttackedSquares` calls
+    // (replaced with `findSliderAttacksOnly | nonSliderAtk_X`).
+    template <uint8 chance>
+    __declspec(noinline)
+    static uint64 countMovesPairWithAtk(
+        QuadBitBoard *posA, GameState *gsA,
+        QuadBitBoard *posB, GameState *gsB,
+        uint64 nonSliderAtkA, uint64 nonSliderAtkB)
+    {
+        // Derive A
+        uint64 allPiecesA    = posA->bb[1] | posA->bb[2] | posA->bb[3];
+        uint64 blackPiecesA  = posA->bb[0];
+        uint64 whitePiecesA  = allPiecesA & ~blackPiecesA;
+        uint64 allPawnsA     = posA->bb[1] & ~posA->bb[2] & ~posA->bb[3];
+        uint64 knightsA      = posA->bb[2] & ~posA->bb[1] & ~posA->bb[3];
+        uint64 bishopQueensA = posA->bb[1] & (posA->bb[2] ^ posA->bb[3]);
+        uint64 rookQueensA   = posA->bb[3] & ~posA->bb[2];
+        uint64 kingsA        = posA->bb[2] & posA->bb[3] & ~posA->bb[1];
+
+        // Derive B
+        uint64 allPiecesB    = posB->bb[1] | posB->bb[2] | posB->bb[3];
+        uint64 blackPiecesB  = posB->bb[0];
+        uint64 whitePiecesB  = allPiecesB & ~blackPiecesB;
+        uint64 allPawnsB     = posB->bb[1] & ~posB->bb[2] & ~posB->bb[3];
+        uint64 knightsB      = posB->bb[2] & ~posB->bb[1] & ~posB->bb[3];
+        uint64 bishopQueensB = posB->bb[1] & (posB->bb[2] ^ posB->bb[3]);
+        uint64 rookQueensB   = posB->bb[3] & ~posB->bb[2];
+        uint64 kingsB        = posB->bb[2] & posB->bb[3] & ~posB->bb[1];
+
+        uint64 myPiecesA    = (chance == WHITE) ? whitePiecesA : blackPiecesA;
+        uint64 enemyPiecesA = (chance == WHITE) ? blackPiecesA : whitePiecesA;
+        uint64 myPiecesB    = (chance == WHITE) ? whitePiecesB : blackPiecesB;
+        uint64 enemyPiecesB = (chance == WHITE) ? blackPiecesB : whitePiecesB;
+
+        uint64 enemyBishopsA = bishopQueensA & enemyPiecesA;
+        uint64 enemyRooksA   = rookQueensA   & enemyPiecesA;
+        uint64 enemyBishopsB = bishopQueensB & enemyPiecesB;
+        uint64 enemyRooksB   = rookQueensB   & enemyPiecesB;
+
+        uint64 myKingA = kingsA & myPiecesA;
+        uint64 myKingB = kingsB & myPiecesB;
+        __assume(myKingA != 0); __assume((myKingA & (myKingA - 1)) == 0);
+        __assume(myKingB != 0); __assume((myKingB & (myKingB - 1)) == 0);
+        uint8 kingIndexA = bitScan(myKingA);
+        uint8 kingIndexB = bitScan(myKingB);
+
+        // Slider-only attacks, OR'd with the SIMD-precomputed non-slider attacks.
+        uint64 threatA = nonSliderAtkA | findSliderAttacksOnly(~allPiecesA, enemyBishopsA, enemyRooksA, myKingA);
+        uint64 threatB = nonSliderAtkB | findSliderAttacksOnly(~allPiecesB, enemyBishopsB, enemyRooksB, myKingB);
+
+        uint64 sum = 0;
+        {
+            uint64 pinnedA = findPinnedPieces(myKingA, myPiecesA, enemyBishopsA, enemyRooksA, allPiecesA, kingIndexA);
+            if (threatA & myKingA) [[unlikely]]
+            {
+                sum += countMovesOutOfCheck<chance>(posA, gsA, allPawnsA, allPiecesA, myPiecesA, enemyPiecesA,
+                                                   pinnedA, threatA, kingIndexA,
+                                                   knightsA, bishopQueensA, rookQueensA, kingsA);
+            }
+            else
+            {
+                bool hasEP = gsA->enPassent != 0;
+                bool hasCastle = (chance == WHITE) ? (gsA->whiteCastle != 0) : (gsA->blackCastle != 0);
+                if (!hasEP)
+                {
+                    if (hasCastle) sum += countMovesFromDerived<chance, false, true >(posA, gsA, allPiecesA, myPiecesA, enemyPiecesA, allPawnsA, knightsA, bishopQueensA, rookQueensA, myKingA, kingIndexA, pinnedA, threatA);
+                    else           sum += countMovesFromDerived<chance, false, false>(posA, gsA, allPiecesA, myPiecesA, enemyPiecesA, allPawnsA, knightsA, bishopQueensA, rookQueensA, myKingA, kingIndexA, pinnedA, threatA);
+                }
+                else
+                {
+                    if (hasCastle) sum += countMovesFromDerived<chance, true,  true >(posA, gsA, allPiecesA, myPiecesA, enemyPiecesA, allPawnsA, knightsA, bishopQueensA, rookQueensA, myKingA, kingIndexA, pinnedA, threatA);
+                    else           sum += countMovesFromDerived<chance, true,  false>(posA, gsA, allPiecesA, myPiecesA, enemyPiecesA, allPawnsA, knightsA, bishopQueensA, rookQueensA, myKingA, kingIndexA, pinnedA, threatA);
+                }
+            }
+        }
+        {
+            uint64 pinnedB = findPinnedPieces(myKingB, myPiecesB, enemyBishopsB, enemyRooksB, allPiecesB, kingIndexB);
+            if (threatB & myKingB) [[unlikely]]
+            {
+                sum += countMovesOutOfCheck<chance>(posB, gsB, allPawnsB, allPiecesB, myPiecesB, enemyPiecesB,
+                                                   pinnedB, threatB, kingIndexB,
+                                                   knightsB, bishopQueensB, rookQueensB, kingsB);
+            }
+            else
+            {
+                bool hasEP = gsB->enPassent != 0;
+                bool hasCastle = (chance == WHITE) ? (gsB->whiteCastle != 0) : (gsB->blackCastle != 0);
+                if (!hasEP)
+                {
+                    if (hasCastle) sum += countMovesFromDerived<chance, false, true >(posB, gsB, allPiecesB, myPiecesB, enemyPiecesB, allPawnsB, knightsB, bishopQueensB, rookQueensB, myKingB, kingIndexB, pinnedB, threatB);
+                    else           sum += countMovesFromDerived<chance, false, false>(posB, gsB, allPiecesB, myPiecesB, enemyPiecesB, allPawnsB, knightsB, bishopQueensB, rookQueensB, myKingB, kingIndexB, pinnedB, threatB);
+                }
+                else
+                {
+                    if (hasCastle) sum += countMovesFromDerived<chance, true,  true >(posB, gsB, allPiecesB, myPiecesB, enemyPiecesB, allPawnsB, knightsB, bishopQueensB, rookQueensB, myKingB, kingIndexB, pinnedB, threatB);
+                    else           sum += countMovesFromDerived<chance, true,  false>(posB, gsB, allPiecesB, myPiecesB, enemyPiecesB, allPawnsB, knightsB, bishopQueensB, rookQueensB, myKingB, kingIndexB, pinnedB, threatB);
+                }
+            }
+        }
+        return sum;
+    }
+
+    // Phase 4+5 attempt: NOT CALLED — slow-path quad regressed +2.4 ms vs the
+    // Phase 4 pair-wise slow path (E71: same i-cache mechanism as the fast quad).
+    template <uint8 chance>
+    __declspec(noinline)
+    static uint64 countMovesQuadWithAtk_UNUSED(
+        QuadBitBoard *posA, GameState *gsA,
+        QuadBitBoard *posB, GameState *gsB,
+        QuadBitBoard *posC, GameState *gsC,
+        QuadBitBoard *posD, GameState *gsD,
+        uint64 atkA, uint64 atkB, uint64 atkC, uint64 atkD)
+    {
+        // 4 derives (scalar, MSVC schedules across 4 ALU ports).
+        uint64 allPiecesA    = posA->bb[1] | posA->bb[2] | posA->bb[3];
+        uint64 allPiecesB    = posB->bb[1] | posB->bb[2] | posB->bb[3];
+        uint64 allPiecesC    = posC->bb[1] | posC->bb[2] | posC->bb[3];
+        uint64 allPiecesD    = posD->bb[1] | posD->bb[2] | posD->bb[3];
+        uint64 allPawnsA     = posA->bb[1] & ~posA->bb[2] & ~posA->bb[3];
+        uint64 allPawnsB     = posB->bb[1] & ~posB->bb[2] & ~posB->bb[3];
+        uint64 allPawnsC     = posC->bb[1] & ~posC->bb[2] & ~posC->bb[3];
+        uint64 allPawnsD     = posD->bb[1] & ~posD->bb[2] & ~posD->bb[3];
+        uint64 knightsA      = posA->bb[2] & ~posA->bb[1] & ~posA->bb[3];
+        uint64 knightsB      = posB->bb[2] & ~posB->bb[1] & ~posB->bb[3];
+        uint64 knightsC      = posC->bb[2] & ~posC->bb[1] & ~posC->bb[3];
+        uint64 knightsD      = posD->bb[2] & ~posD->bb[1] & ~posD->bb[3];
+        uint64 bishopQueensA = posA->bb[1] & (posA->bb[2] ^ posA->bb[3]);
+        uint64 bishopQueensB = posB->bb[1] & (posB->bb[2] ^ posB->bb[3]);
+        uint64 bishopQueensC = posC->bb[1] & (posC->bb[2] ^ posC->bb[3]);
+        uint64 bishopQueensD = posD->bb[1] & (posD->bb[2] ^ posD->bb[3]);
+        uint64 rookQueensA   = posA->bb[3] & ~posA->bb[2];
+        uint64 rookQueensB   = posB->bb[3] & ~posB->bb[2];
+        uint64 rookQueensC   = posC->bb[3] & ~posC->bb[2];
+        uint64 rookQueensD   = posD->bb[3] & ~posD->bb[2];
+        uint64 kingsA        = posA->bb[2] & posA->bb[3] & ~posA->bb[1];
+        uint64 kingsB        = posB->bb[2] & posB->bb[3] & ~posB->bb[1];
+        uint64 kingsC        = posC->bb[2] & posC->bb[3] & ~posC->bb[1];
+        uint64 kingsD        = posD->bb[2] & posD->bb[3] & ~posD->bb[1];
+        uint64 blackPiecesA  = posA->bb[0];
+        uint64 blackPiecesB  = posB->bb[0];
+        uint64 blackPiecesC  = posC->bb[0];
+        uint64 blackPiecesD  = posD->bb[0];
+        uint64 whitePiecesA  = allPiecesA & ~blackPiecesA;
+        uint64 whitePiecesB  = allPiecesB & ~blackPiecesB;
+        uint64 whitePiecesC  = allPiecesC & ~blackPiecesC;
+        uint64 whitePiecesD  = allPiecesD & ~blackPiecesD;
+
+        uint64 myPiecesA    = (chance == WHITE) ? whitePiecesA : blackPiecesA;
+        uint64 enemyPiecesA = (chance == WHITE) ? blackPiecesA : whitePiecesA;
+        uint64 myPiecesB    = (chance == WHITE) ? whitePiecesB : blackPiecesB;
+        uint64 enemyPiecesB = (chance == WHITE) ? blackPiecesB : whitePiecesB;
+        uint64 myPiecesC    = (chance == WHITE) ? whitePiecesC : blackPiecesC;
+        uint64 enemyPiecesC = (chance == WHITE) ? blackPiecesC : whitePiecesC;
+        uint64 myPiecesD    = (chance == WHITE) ? whitePiecesD : blackPiecesD;
+        uint64 enemyPiecesD = (chance == WHITE) ? blackPiecesD : whitePiecesD;
+
+        uint64 enemyBishopsA = bishopQueensA & enemyPiecesA;
+        uint64 enemyRooksA   = rookQueensA   & enemyPiecesA;
+        uint64 enemyBishopsB = bishopQueensB & enemyPiecesB;
+        uint64 enemyRooksB   = rookQueensB   & enemyPiecesB;
+        uint64 enemyBishopsC = bishopQueensC & enemyPiecesC;
+        uint64 enemyRooksC   = rookQueensC   & enemyPiecesC;
+        uint64 enemyBishopsD = bishopQueensD & enemyPiecesD;
+        uint64 enemyRooksD   = rookQueensD   & enemyPiecesD;
+
+        uint64 myKingA = kingsA & myPiecesA;
+        uint64 myKingB = kingsB & myPiecesB;
+        uint64 myKingC = kingsC & myPiecesC;
+        uint64 myKingD = kingsD & myPiecesD;
+        __assume(myKingA != 0); __assume((myKingA & (myKingA - 1)) == 0);
+        __assume(myKingB != 0); __assume((myKingB & (myKingB - 1)) == 0);
+        __assume(myKingC != 0); __assume((myKingC & (myKingC - 1)) == 0);
+        __assume(myKingD != 0); __assume((myKingD & (myKingD - 1)) == 0);
+        uint8 kingIndexA = bitScan(myKingA);
+        uint8 kingIndexB = bitScan(myKingB);
+        uint8 kingIndexC = bitScan(myKingC);
+        uint8 kingIndexD = bitScan(myKingD);
+
+        // 4-way interleaved scalar slider attacks across all 4 children.
+        // OoO can keep ~4 magic-LUT loads in flight simultaneously.
+        uint64 sliderAtkA, sliderAtkB, sliderAtkC, sliderAtkD;
+        findSliderAttacksOnly4(
+            ~allPiecesA, enemyBishopsA, enemyRooksA, myKingA,
+            ~allPiecesB, enemyBishopsB, enemyRooksB, myKingB,
+            ~allPiecesC, enemyBishopsC, enemyRooksC, myKingC,
+            ~allPiecesD, enemyBishopsD, enemyRooksD, myKingD,
+            sliderAtkA, sliderAtkB, sliderAtkC, sliderAtkD);
+
+        uint64 threatA = atkA | sliderAtkA;
+        uint64 threatB = atkB | sliderAtkB;
+        uint64 threatC = atkC | sliderAtkC;
+        uint64 threatD = atkD | sliderAtkD;
+
+        uint64 pinnedA = findPinnedPieces(myKingA, myPiecesA, enemyBishopsA, enemyRooksA, allPiecesA, kingIndexA);
+        uint64 pinnedB = findPinnedPieces(myKingB, myPiecesB, enemyBishopsB, enemyRooksB, allPiecesB, kingIndexB);
+        uint64 pinnedC = findPinnedPieces(myKingC, myPiecesC, enemyBishopsC, enemyRooksC, allPiecesC, kingIndexC);
+        uint64 pinnedD = findPinnedPieces(myKingD, myPiecesD, enemyBishopsD, enemyRooksD, allPiecesD, kingIndexD);
+
+        uint64 sum = 0;
+        #define QWA_DISPATCH_LANE(L) do { \
+            if (threat##L & myKing##L) [[unlikely]] { \
+                sum += countMovesOutOfCheck<chance>(pos##L, gs##L, allPawns##L, allPieces##L, myPieces##L, enemyPieces##L, \
+                                                    pinned##L, threat##L, kingIndex##L, \
+                                                    knights##L, bishopQueens##L, rookQueens##L, kings##L); \
+            } else { \
+                bool hasEP = gs##L->enPassent != 0; \
+                bool hasCastle = (chance == WHITE) ? (gs##L->whiteCastle != 0) : (gs##L->blackCastle != 0); \
+                if (!hasEP) { \
+                    if (hasCastle) sum += countMovesFromDerived<chance, false, true >(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                    else           sum += countMovesFromDerived<chance, false, false>(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                } else { \
+                    if (hasCastle) sum += countMovesFromDerived<chance, true,  true >(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                    else           sum += countMovesFromDerived<chance, true,  false>(pos##L, gs##L, allPieces##L, myPieces##L, enemyPieces##L, allPawns##L, knights##L, bishopQueens##L, rookQueens##L, myKing##L, kingIndex##L, pinned##L, threat##L); \
+                } \
+            } \
+        } while (0)
+        QWA_DISPATCH_LANE(A);
+        QWA_DISPATCH_LANE(B);
+        QWA_DISPATCH_LANE(C);
+        QWA_DISPATCH_LANE(D);
+        #undef QWA_DISPATCH_LANE
         return sum;
     }
 
