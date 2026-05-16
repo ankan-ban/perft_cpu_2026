@@ -53,6 +53,16 @@ And on an **AMD Ryzen 9 9950X3D (16 cores / 32 threads)**:
 
 The 9950X3D edges out the Intel chip on the single-threaded leaf benchmark but trails it on the multi-threaded ones — with only 16 physical cores vs the Intel's 24, `-mt 32` is 2× SMT-oversubscribed and the per-thread contention outweighs the per-thread perf advantage.
 
+And on an **Apple M4 (4 P-cores + 6 E-cores)** with Apple clang 17 / `-O3 -flto`:
+
+| Position | Depth | Nodes | Configuration | Time | Speed |
+|---|---|---|---|---|---|
+| [Position 2](https://www.chessprogramming.org/Perft_Results#Position_2) (Kiwipete) | 5 | 193,690,690 | single-thread, no TT, non-PGO | **65.4 ms** | ~2.96 billion nps |
+| [Position 2](https://www.chessprogramming.org/Perft_Results#Position_2) (Kiwipete) | 7 | 374,190,009,323 | `-mt 10`, no TT, non-PGO | **21.72 s** | ~17.2 billion nps |
+| Starting position | 10 | 69,352,859,712,417 | `-mt 10`, TT on, non-PGO | **386.7 s** | ~179 billion nps |
+
+The M4 wins the single-threaded leaf benchmark — its per-P-core throughput beats both x86 chips even without PGO — but loses the multi-threaded ones, which is essentially a thread-count story (10 cores vs 24/32). Clang frontend PGO (`-fprofile-instr-generate` trained on kiwipete perft 5) actually *regressed* all three numbers by ~2–3 % on this codebase, so the table above is non-PGO across the board.
+
 ### PGO note
 
 PGO (`-DPERFT_PGO=USE` after a `GEN` + training cycle) helps the **no-TT** raw-move-generation runs by ~5–7 %, but **hurts** the TT-heavy long runs (perft 10 with TT on regresses by ~7 % vs the non-PGO build). The whole-program inliner ends up over-fitting to whatever workload it was trained on — and it's impractical to PGO-train on the larger TT-on workloads we actually care about (a perft 10 training pass would take many minutes per cycle). The default non-PGO configuration is the right choice for the TT-on case.
