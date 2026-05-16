@@ -54,6 +54,12 @@ if(MSVC)
         # config disables them. Used only for hot-path inspection.
         target_compile_options(perft_cpu PRIVATE /O2 /Ob3 /Oi /Ot /fp:fast /Zi /FAs)
         target_link_options(perft_cpu PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    elseif(PERFT_NO_LTCG)
+        # Per-TU O2 without /GL + /LTCG. Useful when PGO is off — the whole-program
+        # inliner makes different (often worse) decisions than per-TU /Ob3 on this
+        # heavily-templated code.
+        target_compile_options(perft_cpu PRIVATE /O2 /Ob3 /Oi /Ot /fp:fast /Zi)
+        target_link_options(perft_cpu PRIVATE /DEBUG /OPT:REF /OPT:ICF)
     elseif(PERFT_PGO STREQUAL "GEN")
         target_compile_options(perft_cpu PRIVATE /O2 /Ob3 /Oi /Ot /fp:fast /Zi /GL)
         target_link_options(perft_cpu PRIVATE /DEBUG /OPT:REF /OPT:ICF /LTCG /GENPROFILE)

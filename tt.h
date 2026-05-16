@@ -4,16 +4,54 @@
 #include "zobrist.h"
 
 // -------------------------------------------------------------------------
-// Lossless chained transposition table for CPU perft.
-//
-// No entry is ever evicted (subject to pool capacity) — keys are 128-bit
-// Zobrist so collisions are negligible, and each (position, depth) tuple
-// gets its own pool entry.
-//
-// Thread-safety: losslessStore uses a saturating CAS allocator for slot
-// reservation and a CAS loop for chain prepend; losslessProbe is read-only.
-// Two threads racing on the same position may briefly miss each other's
-// stores (causing a small amount of duplicate work) but never corrupt.
+// Lossy open-addressing TT (Hyatt/Crafty XOR-lockless scheme).
+//   Store: verification = (hash.hi ^ hash.lo) ^ count
+//   Probe: if ((verification ^ count) == hash.hi ^ hash.lo) → hit
+// Multi-thread safety: torn reads / racing writes are detected by the XOR
+// mismatch and reported as a miss (causes recompute, never a wrong count).
+// Single 16-byte slot per bucket — no chain walk, no CAS.
+// -------------------------------------------------------------------------
+
+struct TTEntry
+{
+    uint64 verification;   // (hash.hi ^ hash.lo) ^ count
+    uint64 count;
+};
+
+CT_ASSERT(sizeof(TTEntry) == 16);
+
+struct TTTable
+{
+    TTEntry *entries;       // power-of-2-sized array
+    uint64 mask;            // numEntries - 1
+};
+
+inline bool ttProbe(const TTTable &tt, Hash128 hash, uint64 *outCount)
+{
+    if (!tt.entries) return false;
+    uint64 idx = hash.lo & tt.mask;
+    uint64 storedCount = tt.entries[idx].count;
+    uint64 storedVerif = tt.entries[idx].verification;
+    uint64 expectedKey = hash.hi ^ hash.lo;
+    if ((storedVerif ^ storedCount) == expectedKey)
+    {
+        *outCount = storedCount;
+        return true;
+    }
+    return false;
+}
+
+inline void ttStore(const TTTable &tt, Hash128 hash, uint64 count)
+{
+    if (!tt.entries) return;
+    uint64 idx = hash.lo & tt.mask;
+    tt.entries[idx].count = count;
+    tt.entries[idx].verification = (hash.hi ^ hash.lo) ^ count;
+}
+
+// -------------------------------------------------------------------------
+// Legacy lossless chained TT (kept for reference / fallback experiments).
+// No entry is ever evicted — 128-bit Zobrist makes collisions negligible.
 // -------------------------------------------------------------------------
 
 struct LosslessEntry
@@ -28,11 +66,11 @@ CT_ASSERT(sizeof(LosslessEntry) == 24);
 
 struct LosslessTT
 {
-    int32_t *buckets;           // bucket heads (-1 = empty)
-    LosslessEntry *pool;        // entry pool
-    uint64 bucketMask;          // numBuckets - 1
-    int32_t nextFree;           // next free entry
-    int32_t poolCapacity;       // max entries in pool
+    int32_t *buckets;
+    LosslessEntry *pool;
+    uint64 bucketMask;
+    int32_t nextFree;
+    int32_t poolCapacity;
 };
 
 inline bool losslessProbe(const LosslessTT &tt, Hash128 hash, uint64 *outCount)
@@ -40,12 +78,6 @@ inline bool losslessProbe(const LosslessTT &tt, Hash128 hash, uint64 *outCount)
     if (!tt.buckets) return false;
     uint64 bucket = hash.lo & tt.bucketMask;
     uint64 key = hash.hi ^ hash.lo;
-    // Acquire load on the bucket head: pairs with the seq_cst CAS in losslessStore.
-    // Without this, a weakly-ordered reader (ARM64) can see the new head index but
-    // speculatively read stale pool entries written before the CAS — causing many
-    // spurious TT misses under MT and a lot of duplicate work at deep perft.
-    // MSVC defaults to /volatile:ms on ARM/ARM64 which gives volatile loads
-    // acquire semantics; on x86/x64 ordinary loads are already acquire.
     int32_t idx = *(volatile int32_t *)&tt.buckets[bucket];
     while (idx >= 0)
     {
@@ -62,17 +94,11 @@ inline bool losslessProbe(const LosslessTT &tt, Hash128 hash, uint64 *outCount)
 inline void losslessStore(LosslessTT &tt, Hash128 hash, uint64 count)
 {
     if (!tt.buckets) return;
-    // Saturating CAS bump allocator — safe for concurrent stores from multiple
-    // threads. An unconditional InterlockedIncrement keeps growing nextFree even
-    // when the table is full; with enough threads × stores that wraps int32
-    // negative and then back to small positive values, which both writes OOB
-    // and silently overwrites earlier entries (TT corruption). The CAS loop
-    // below stops at poolCapacity exactly.
 #ifdef _MSC_VER
     long newIdx;
     long cur = *(volatile long *)&tt.nextFree;
     do {
-        if (cur >= tt.poolCapacity) return;  // table full, drop the store
+        if (cur >= tt.poolCapacity) return;
         newIdx = cur;
     } while ((cur = _InterlockedCompareExchange((volatile long *)&tt.nextFree,
                                                 newIdx + 1, newIdx)) != newIdx);
@@ -86,7 +112,6 @@ inline void losslessStore(LosslessTT &tt, Hash128 hash, uint64 count)
     uint64 bucket = hash.lo & tt.bucketMask;
     tt.pool[newIdx].hashKey = hash.hi ^ hash.lo;
     tt.pool[newIdx].count = count;
-    // CAS loop to prepend to bucket chain.
 #ifdef _MSC_VER
     long oldHead;
     do {
@@ -105,17 +130,54 @@ inline void losslessStore(LosslessTT &tt, Hash128 hash, uint64 count)
 }
 
 // -------------------------------------------------------------------------
-// TT management (allocation, deallocation)
+// TT management
 // -------------------------------------------------------------------------
 
 #define MAX_TT_DEPTH 32
 
-// Global TT array (defined in launcher.cpp). Indexed by remaining depth.
-extern LosslessTT hostLosslessTTs[MAX_TT_DEPTH];
+// Hybrid TT layout:
+//   Depth 3..LOSSY_TT_MAX_DEPTH → lossy open-addressing (hostTTs)
+//   Depth LOSSY_TT_MAX_DEPTH+1..MAX_TT_DEPTH-1 → lossless chained (hostLosslessTTs)
+// Shallow remaining-depth tables hold millions of entries each visited many times
+// (transpositions); collisions are cheap because recompute is a small FGMC subtree.
+// Deep remaining-depth tables hold few but expensive entries (each represents a huge
+// subtree); losing one would force enormous recompute, so we keep them lossless and
+// sized to hold all expected entries.
+#define LOSSY_TT_MAX_DEPTH 6
+
+extern TTTable     hostTTs        [MAX_TT_DEPTH];
+extern LosslessTT  hostLosslessTTs[MAX_TT_DEPTH];
+
+inline bool perftTTProbe(int depth, Hash128 hash, uint64 *outCount)
+{
+    if (depth <= LOSSY_TT_MAX_DEPTH)
+        return ttProbe(hostTTs[depth], hash, outCount);
+    return losslessProbe(hostLosslessTTs[depth], hash, outCount);
+}
+
+inline void perftTTStore(int depth, Hash128 hash, uint64 count)
+{
+    if (depth <= LOSSY_TT_MAX_DEPTH)
+        ttStore(hostTTs[depth], hash, count);
+    else
+        losslessStore(hostLosslessTTs[depth], hash, count);
+}
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+inline void perftTTPrefetch(int depth, Hash128 hash)
+{
+    if (depth <= LOSSY_TT_MAX_DEPTH && hostTTs[depth].entries)
+    {
+        uint64 idx = hash.lo & hostTTs[depth].mask;
+        _mm_prefetch((const char *)&hostTTs[depth].entries[idx], _MM_HINT_T0);
+    }
+}
+#else
+inline void perftTTPrefetch(int, Hash128) {}
+#endif
 
 // Initialize TTs for the given max depth and average branching factor.
-// Memory is split across depths roughly proportional to branchingFactor^(maxDepth - d)
-// so the densely-occupied shallow depths get the lion's share.
 void initTT(int maxDepth, float branchingFactor);
 
 // Free all TT memory.

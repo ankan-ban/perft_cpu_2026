@@ -234,6 +234,13 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
             argc -= 2; i--; continue;
         }
+        if (strcmp(argv[i], "-tt2") == 0 && i + 1 < argc)
+        {
+            // -tt2 <MB> : size of the lossy TT at depth 2 (0 disables).
+            g_tt2EntriesMB = atoi(argv[i + 1]);
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2; i--; continue;
+        }
         if (strcmp(argv[i], "-mt") == 0 && i + 1 < argc)
         {
             // -mt N : run with N threads at the root (0 = all hw threads).
@@ -351,7 +358,10 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    initTT(maxDepth, 30.0f);
+    // BF = 10 (not 30): with FGMC handling depths ≤ 2, the only TTs are TT[3..N].
+    // Observed per-depth unique-position ratio for startpos is ~10:1, not the
+    // raw branching factor of ~30 (transpositions collapse a lot of the tree).
+    initTT(maxDepth, 10.0f);
 
 #ifdef _WIN32
     if (doProfile) prof::start();

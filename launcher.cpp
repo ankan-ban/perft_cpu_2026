@@ -4,6 +4,9 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+  #include <emmintrin.h>  // _mm_prefetch
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -130,10 +133,18 @@ bool g_useTT = true;
 // host TT is thread-safe (atomic slot-bump + CAS chain prepend).
 int g_numThreads = 1;
 
-LosslessTT hostLosslessTTs[MAX_TT_DEPTH];
+TTTable     hostTTs        [MAX_TT_DEPTH];
+LosslessTT  hostLosslessTTs[MAX_TT_DEPTH];
 
 // Overridable host TT budget (set from CLI before calling initTT)
 int g_hostTTBudgetMB = HOST_TT_BUDGET_MB;
+
+// TT[2] size in MB (-tt2 N). 0 disables TT[2]; default 2048 MB.
+// Sweet-spot range is ~2–6 GB on the 24-thread Arrow Lake (32 GB RAM): below 1 GB
+// per-thread working sets exceed the table; above 6-8 GB DRAM pressure cliffs.
+// (TT[1] was tried and lost decisively — see git log; the FGMC depth-2 path is
+// faster than any hash+probe loop can match at depth 1.)
+int g_tt2EntriesMB = 2048;
 
 // -------------------------------------------------------------------------
 // Transposition table allocation
@@ -153,16 +164,45 @@ static uint64 floorPow2(uint64 n)
 
 void initTT(int maxDepth, float branchingFactor)
 {
+    memset(hostTTs,         0, sizeof(hostTTs));
     memset(hostLosslessTTs, 0, sizeof(hostLosslessTTs));
     if (!g_useTT) return;
 
-    // Host TTs for depths 2..maxDepth (depth 1 doesn't recurse).
+    // Host TTs for depths 3..maxDepth. Depth 1 doesn't recurse; depth 2 uses
+    // the fused FGMC leaf path unconditionally (no TT lookup — see perft_cpu).
     int numHostTTs = 0;
-    for (int d = 2; d <= maxDepth && d < MAX_TT_DEPTH; d++)
+    for (int d = 3; d <= maxDepth && d < MAX_TT_DEPTH; d++)
         numHostTTs++;
     if (numHostTTs == 0) return;
 
-    // Auto-detect: 90% of total system RAM
+    // TT[2] is sized independently of the BF-weighted budget below. Per-thread
+    // working set at depth 2 is dominated by recent hot positions, so cache-fit
+    // sizing matters more than capacity. Sweet spot empirically ~2 GB on this box.
+    if (g_tt2EntriesMB > 0)
+    {
+        uint64 numEntries = ((uint64)g_tt2EntriesMB * 1024 * 1024) / sizeof(TTEntry);
+        uint64 pow2 = 1;
+        while (pow2 < numEntries) pow2 <<= 1;
+        if (pow2 > numEntries) pow2 >>= 1;
+        numEntries = pow2;
+        if (numEntries >= 1024)
+        {
+            TTEntry *entries = (TTEntry *)malloc(numEntries * sizeof(TTEntry));
+            if (entries)
+            {
+                memset(entries, 0, numEntries * sizeof(TTEntry));
+                hostTTs[2].entries = entries;
+                hostTTs[2].mask = numEntries - 1;
+                uint64 totalMB = numEntries * sizeof(TTEntry) / (1024*1024);
+                const char *unit = ""; uint64 disp = numEntries;
+                if (numEntries >= 1024*1024) { unit = "M"; disp = numEntries / (1024*1024); }
+                else if (numEntries >= 1024) { unit = "K"; disp = numEntries / 1024; }
+                printf("Host TT[2] (lossy): %llu%s entries (%llu MB)\n",
+                       (unsigned long long)disp, unit, (unsigned long long)totalMB);
+            }
+        }
+    }
+
     if (g_hostTTBudgetMB <= 0)
     {
         uint64 totalRAM = 0;
@@ -180,32 +220,76 @@ void initTT(int maxDepth, float branchingFactor)
         if (totalRAM > 0)
             g_hostTTBudgetMB = (int)((totalRAM * 9 / 10) / (1024 * 1024));
         else
-            g_hostTTBudgetMB = 8192;  // fallback
+            g_hostTTBudgetMB = 8192;
         printf("Host TT budget: auto %d MB (90%% of %llu MB system RAM)\n",
                g_hostTTBudgetMB, (unsigned long long)(totalRAM / (1024 * 1024)));
     }
     uint64 budgetBytes = (uint64)g_hostTTBudgetMB * 1024 * 1024;
 
-    // Budget split proportional to branchingFactor^(maxDepth - d). Shallow depths
-    // (small d) get the lion's share since they hold many more unique entries.
+    // Budget weights cover only the LOSSY band (3..LOSSY_TT_MAX_DEPTH). Lossless
+    // tables for deeper remaining-depths are tiny and sized independently below.
     double weights[MAX_TT_DEPTH];
     memset(weights, 0, sizeof(weights));
     double totalWeight = 0;
-    for (int d = 2; d <= maxDepth && d < MAX_TT_DEPTH; d++)
+    int lossyEnd = (LOSSY_TT_MAX_DEPTH <= maxDepth) ? LOSSY_TT_MAX_DEPTH : maxDepth;
+    for (int d = 3; d <= lossyEnd && d < MAX_TT_DEPTH; d++)
     {
-        weights[d] = pow((double)branchingFactor, maxDepth - d);
+        weights[d] = pow((double)branchingFactor, lossyEnd - d);
         totalWeight += weights[d];
     }
 
-    uint64 bytesPerSlot = sizeof(LosslessEntry) + sizeof(int32_t);  // pool entry + bucket head
-
-    for (int d = 2; d <= maxDepth && d < MAX_TT_DEPTH; d++)
+    // Allocate lossy TTs for the dense shallow band. No per-depth caps — the
+    // BF-weighted budget naturally gives TT[3] the bulk and scales for deeper
+    // perfts; capping just shrinks the working set at higher maxDepth.
+    for (int d = 3; d <= lossyEnd && d < MAX_TT_DEPTH; d++)
     {
         uint64 depthBytes = (uint64)(budgetBytes * weights[d] / totalWeight);
-        uint64 numSlots = depthBytes / bytesPerSlot;
-        numSlots = floorPow2(numSlots);
-        if (numSlots < 4 * 1024 * 1024) numSlots = 4 * 1024 * 1024;
-        if (numSlots > (1ull << 30)) numSlots = (1ull << 30);  // cap for int32_t safety
+        uint64 numEntries = floorPow2(depthBytes / sizeof(TTEntry));
+        if (numEntries < 1ull * 1024 * 1024) numEntries = 1ull * 1024 * 1024;  // 1M floor (16 MB)
+
+        TTEntry *entries = (TTEntry *)malloc(numEntries * sizeof(TTEntry));
+        if (entries)
+        {
+            memset(entries, 0, numEntries * sizeof(TTEntry));
+            hostTTs[d].entries = entries;
+            hostTTs[d].mask = numEntries - 1;
+
+            uint64 totalMB = numEntries * sizeof(TTEntry) / (1024*1024);
+            const char *unit = ""; uint64 dispEntries = numEntries;
+            if (numEntries >= 1024*1024) { unit = "M"; dispEntries = numEntries / (1024*1024); }
+            else if (numEntries >= 1024) { unit = "K"; dispEntries = numEntries / 1024; }
+            printf("Host TT[%d] (lossy): %llu%s entries (%llu MB)\n",
+                   d, (unsigned long long)dispEntries, unit, (unsigned long long)totalMB);
+        }
+        else
+        {
+            printf("Warning: failed to allocate host TT[%d] (%llu MB)\n",
+                   d, (unsigned long long)(numEntries * sizeof(TTEntry) / (1024*1024)));
+        }
+    }
+
+    // Allocate lossless chained TTs for the deep band. Few entries each but each
+    // is enormously expensive to recompute, so we must size to hold them all.
+    // Estimated max entries at depth d (caching subtree of remaining depth d) is
+    // bounded by the perft count at distance (maxDepth - d) from the root —
+    // each unique reachable position contributes at most one entry. For startpos:
+    //   maxDepth=9: d=7 has ~400, d=8 has ~20, d=9 has 1.
+    //   maxDepth=10: d=7 has ~4K, d=8 has ~200, d=9 has ~20, d=10 has 1.
+    // We use perft growth^(maxDepth-d) where growth ≈ 30 is the raw branching
+    // factor, capped to a reasonable max. Plenty of headroom for any feasible perft.
+    for (int d = LOSSY_TT_MAX_DEPTH + 1; d <= maxDepth && d < MAX_TT_DEPTH; d++)
+    {
+        // Conservative upper bound on unique positions at distance (maxDepth-d) from root
+        double distFromRoot = (double)(maxDepth - d);
+        double est = pow(30.0, distFromRoot);
+        if (est < 1.0) est = 1.0;
+        uint64 numSlots = (uint64)(est * 4.0);  // 4x oversize for low load factor
+        // Power-of-2 round up
+        uint64 pow2 = 1;
+        while (pow2 < numSlots) pow2 <<= 1;
+        numSlots = pow2;
+        if (numSlots < 1024) numSlots = 1024;
+        if (numSlots > (1ull << 28)) numSlots = (1ull << 28);  // 256M cap
 
         int32_t poolCap = (int32_t)numSlots;
         uint64 numBuckets = numSlots;
@@ -214,7 +298,7 @@ void initTT(int maxDepth, float branchingFactor)
         hostLosslessTTs[d].pool = (LosslessEntry *)malloc((uint64)poolCap * sizeof(LosslessEntry));
         if (hostLosslessTTs[d].buckets && hostLosslessTTs[d].pool)
         {
-            memset(hostLosslessTTs[d].buckets, 0xFF, numBuckets * sizeof(int32_t));  // -1 = empty
+            memset(hostLosslessTTs[d].buckets, 0xFF, numBuckets * sizeof(int32_t));
             hostLosslessTTs[d].bucketMask = numBuckets - 1;
             hostLosslessTTs[d].nextFree = 0;
             hostLosslessTTs[d].poolCapacity = poolCap;
@@ -242,6 +326,8 @@ void freeTT()
 {
     for (int d = 0; d < MAX_TT_DEPTH; d++)
     {
+        free(hostTTs[d].entries);
+        memset(&hostTTs[d], 0, sizeof(TTTable));
         free(hostLosslessTTs[d].buckets);
         free(hostLosslessTTs[d].pool);
         memset(&hostLosslessTTs[d], 0, sizeof(LosslessTT));
@@ -264,32 +350,111 @@ static uint64 perft_cpu(QuadBitBoard *pos, GameState *gs, uint32 depth, Hash128 
     if (depth == 1)
         return MoveGeneratorBitboard::countMoves<chance>(pos, gs);
 
-    if (useTT)
+    if (depth == 2)
     {
-        uint64 ttCount;
-        if (losslessProbe(hostLosslessTTs[depth], hash, &ttCount))
-            return ttCount;
+        if constexpr (useTT)
+        {
+            uint64 ttCount;
+            if (perftTTProbe(2, hash, &ttCount))
+                return ttCount;
+            uint64 count = MoveGeneratorBitboard::countTwoLevelSubtree<chance>(pos, gs);
+            perftTTStore(2, hash, count);
+            return count;
+        }
+        return MoveGeneratorBitboard::countTwoLevelSubtree<chance>(pos, gs);
     }
 
-    if (!useTT && depth == 2)
-        return MoveGeneratorBitboard::countTwoLevelSubtree<chance>(pos, gs);
-    if (!useTT && depth == 3)
+    if (depth == 3)
+    {
+        if constexpr (useTT)
+        {
+            uint64 ttCount;
+            if (perftTTProbe(3, hash, &ttCount))
+                return ttCount;
+            // useTT: drop FGMC at depth=3 so each depth-2 child has its own hash
+            // and can probe TT[2]. Software-pipelined: pass 1 computes each
+            // child's pos/gs/hash and prefetches its TT[2] bucket; pass 2 probes
+            // and recurses. The probe at depth=2 is the single biggest profile
+            // hotspot (~30 % of ST samples) because TT[2] is large (2 GB) and
+            // most lookups miss the cache. Doing 30 prefetches up-front and then
+            // 30 recursions lets the DRAM lines stream in during the work.
+            CMove moves[MAX_MOVES];
+            int nMoves = MoveGeneratorBitboard::generateMoves<chance>(pos, gs, moves);
+
+            // Per-child buffers (kept in cache; nMoves ≤ MAX_MOVES so this is
+            // ~13 KB of stack, fine for the 1-level-deep recursion at depth 3).
+            QuadBitBoard childPos [MAX_MOVES];
+            GameState    childGs  [MAX_MOVES];
+            Hash128      childHash[MAX_MOVES];
+
+            const TTTable &tt2 = hostTTs[2];
+
+            for (int i = 0; i < nMoves; i++)
+            {
+                childPos[i] = *pos;
+                childGs [i] = *gs;
+                uint8 srcPiece     = getPieceAt(pos, moves[i].getFrom());
+                uint8 capPiece     = getPieceAt(pos, moves[i].getTo());
+                uint8 oldCastleRaw = gs->raw;
+                uint8 oldEP        = gs->enPassent;
+                MoveGeneratorBitboard::makeMove<chance>(&childPos[i], &childGs[i], moves[i]);
+                childHash[i] = updateHashAfterMove(hash, moves[i], chance,
+                    srcPiece, capPiece, oldCastleRaw, childGs[i].raw, oldEP, childGs[i].enPassent);
+                if (tt2.entries)
+                {
+                    uint64 idx = childHash[i].lo & tt2.mask;
+                    _mm_prefetch((const char *)&tt2.entries[idx], _MM_HINT_T0);
+                }
+            }
+
+            uint64 count = 0;
+            for (int i = 0; i < nMoves; i++)
+                count += perft_cpu<!chance, true>(&childPos[i], &childGs[i], 2, childHash[i]);
+
+            perftTTStore(3, hash, count);
+            return count;
+        }
         return MoveGeneratorBitboard::countThreeLevelSubtree<chance>(pos, gs);
+    }
+
+    // Depth >= 4.
+    if constexpr (useTT)
+    {
+        uint64 ttCount;
+        if (perftTTProbe(depth, hash, &ttCount))
+            return ttCount;
+    }
 
     CMove moves[MAX_MOVES];
     int nMoves = MoveGeneratorBitboard::generateMoves<chance>(pos, gs, moves);
 
     uint64 count = 0;
-    if (depth == 2)
+    if constexpr (useTT)
     {
-        // useTT path uses the explicit two-pass leaf so per-child state isn't needed.
+        // Same SoA + prefetch pattern as depth==3. The biggest gain comes at
+        // depth==4 where the child probes TT[3] (a 16 GB lossy table that's
+        // almost entirely in DRAM); deeper depths get progressively smaller
+        // wins but the cost is uniform.
+        QuadBitBoard childPos [MAX_MOVES];
+        GameState    childGs  [MAX_MOVES];
+        Hash128      childHash[MAX_MOVES];
+
         for (int i = 0; i < nMoves; i++)
         {
-            QuadBitBoard childPos = *pos;
-            GameState childGs = *gs;
-            MoveGeneratorBitboard::makeMove<chance>(&childPos, &childGs, moves[i]);
-            count += MoveGeneratorBitboard::countMoves<!chance>(&childPos, &childGs);
+            childPos[i] = *pos;
+            childGs [i] = *gs;
+            uint8 srcPiece     = getPieceAt(pos, moves[i].getFrom());
+            uint8 capPiece     = getPieceAt(pos, moves[i].getTo());
+            uint8 oldCastleRaw = gs->raw;
+            uint8 oldEP        = gs->enPassent;
+            MoveGeneratorBitboard::makeMove<chance>(&childPos[i], &childGs[i], moves[i]);
+            childHash[i] = updateHashAfterMove(hash, moves[i], chance,
+                srcPiece, capPiece, oldCastleRaw, childGs[i].raw, oldEP, childGs[i].enPassent);
+            perftTTPrefetch((int)depth - 1, childHash[i]);
         }
+        for (int i = 0; i < nMoves; i++)
+            count += perft_cpu<!chance, true>(&childPos[i], &childGs[i], depth - 1, childHash[i]);
+        perftTTStore(depth, hash, count);
     }
     else
     {
@@ -297,31 +462,10 @@ static uint64 perft_cpu(QuadBitBoard *pos, GameState *gs, uint32 depth, Hash128 
         {
             QuadBitBoard childPos = *pos;
             GameState childGs = *gs;
-
-            if (useTT)
-            {
-                uint8 srcPiece = getPieceAt(pos, moves[i].getFrom());
-                uint8 capPiece = getPieceAt(pos, moves[i].getTo());
-                uint8 oldCastleRaw = gs->raw;
-                uint8 oldEP = gs->enPassent;
-
-                MoveGeneratorBitboard::makeMove<chance>(&childPos, &childGs, moves[i]);
-
-                Hash128 childHash = updateHashAfterMove(hash, moves[i], chance,
-                    srcPiece, capPiece, oldCastleRaw, childGs.raw, oldEP, childGs.enPassent);
-
-                count += perft_cpu<!chance, true>(&childPos, &childGs, depth - 1, childHash);
-            }
-            else
-            {
-                MoveGeneratorBitboard::makeMove<chance>(&childPos, &childGs, moves[i]);
-                count += perft_cpu<!chance, false>(&childPos, &childGs, depth - 1, hash);
-            }
+            MoveGeneratorBitboard::makeMove<chance>(&childPos, &childGs, moves[i]);
+            count += perft_cpu<!chance, false>(&childPos, &childGs, depth - 1, hash);
         }
     }
-
-    if (useTT)
-        losslessStore(hostLosslessTTs[depth], hash, count);
 
     return count;
 }
@@ -434,7 +578,7 @@ static uint64 perft_cpu_mt2(QuadBitBoard *pos, GameState *gs, uint32 depth, Hash
 
     uint64 result = totalCount.load(std::memory_order_relaxed);
     if constexpr (useTT)
-        losslessStore(hostLosslessTTs[depth], rootHash, result);
+        perftTTStore(depth, rootHash, result);
     return result;
 }
 
@@ -510,7 +654,7 @@ static uint64 perft_cpu_mt(QuadBitBoard *pos, GameState *gs, uint32 depth, Hash1
     uint64 result = totalCount.load(std::memory_order_relaxed);
 
     if constexpr (useTT)
-        losslessStore(hostLosslessTTs[depth], rootHash, result);
+        perftTTStore(depth, rootHash, result);
     return result;
 }
 
@@ -563,6 +707,36 @@ void perftCPU(QuadBitBoard *pos, GameState *gs, uint8 rootColor, uint32 depth)
     if (seconds > 0)
         printf(", nps: %llu", (unsigned long long)((double)result / seconds));
     printf("\n");
+    fflush(stdout);
+}
+
+// Optional TT fill report. Scanning a lossy TT for populated slots is O(capacity)
+// which can be huge (a 16 GB TT[3] = 1 billion entries) — call only on demand,
+// not after every perft iteration.
+void printTTFillReport()
+{
+    for (int d = 2; d < MAX_TT_DEPTH; d++)
+    {
+        if (hostTTs[d].entries)
+        {
+            uint64 cap  = hostTTs[d].mask + 1;
+            uint64 used = 0;
+            for (uint64 i = 0; i < cap; i++)
+                if (hostTTs[d].entries[i].verification | hostTTs[d].entries[i].count)
+                    used++;
+            double pct = 100.0 * (double)used / (double)cap;
+            printf("  TT[%d] (lossy):    used %llu / %llu (%.1f%%)\n", d,
+                   (unsigned long long)used, (unsigned long long)cap, pct);
+        }
+        else if (hostLosslessTTs[d].buckets)
+        {
+            int32_t used = hostLosslessTTs[d].nextFree;
+            if (used > hostLosslessTTs[d].poolCapacity) used = hostLosslessTTs[d].poolCapacity;
+            double pct = 100.0 * (double)used / (double)hostLosslessTTs[d].poolCapacity;
+            printf("  TT[%d] (lossless): used %d / %d (%.1f%%)\n", d, used,
+                   hostLosslessTTs[d].poolCapacity, pct);
+        }
+    }
     fflush(stdout);
 }
 

@@ -165,3 +165,7 @@ pip-log.txt
 # Claude Code
 CLAUDE.md
 .claude/
+
+# CMake build directories and built binaries
+build*/
+*.exe
