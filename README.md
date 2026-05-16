@@ -33,6 +33,20 @@ perft_cpu "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" 9 -mt 8
 perft_cpu "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" 7 -nott
 ```
 
+## Performance
+
+Best-case wall times measured on an **Intel Core Ultra 7 270K Plus (24 threads)** with this codebase:
+
+| Position | Depth | Nodes | Configuration | Time | Speed |
+|---|---|---|---|---|---|
+| [Position 2](https://www.chessprogramming.org/Perft_Results#Position_2) (Kiwipete) | 5 | 193,690,690 | single-thread, no TT, PGO | **74.6 ms** | ~2.60 billion nps |
+| [Position 2](https://www.chessprogramming.org/Perft_Results#Position_2) (Kiwipete) | 7 | 374,190,009,323 | `-mt 24`, no TT, PGO | **7.48 s** | ~50.0 billion nps |
+| Starting position | 10 | 69,352,859,712,417 | `-mt 24`, TT on, non-PGO | **60.42 s** | ~1,148 billion nps |
+
+### PGO note
+
+PGO (`-DPERFT_PGO=USE` after a `GEN` + training cycle) helps the **no-TT** raw-move-generation runs by ~5–7 %, but **hurts** the TT-heavy long runs (perft 10 with TT on regresses by ~7 % vs the non-PGO build). The whole-program inliner ends up over-fitting to whatever workload it was trained on — and it's impractical to PGO-train on the larger TT-on workloads we actually care about (a perft 10 training pass would take many minutes per cycle). The default non-PGO configuration is the right choice for the TT-on case.
+
 ## Building
 
 Requirements:
