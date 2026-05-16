@@ -50,6 +50,46 @@ inline void ttStore(const TTTable &tt, Hash128 hash, uint64 count)
 }
 
 // -------------------------------------------------------------------------
+// Shallow TT — 8-byte entry, used for TT[2] where the perft count fits in
+// 24 bits (depth-2 max ≈ 218×218 ≈ 47K). Packs (high 40 bits of hash) | (24
+// bits of perft) into a single uint64. With table size ≥ 2²⁴, the slot
+// index implicitly verifies the low 24 hash bits, so the high-40 stored
+// portion completes 64-bit hash verification — no collision detection lost
+// vs the 16-byte TTEntry, at half the memory. Aligned-uint64 reads/writes
+// are atomic on x86, so no torn-read concerns under MT.
+// (Idea: ankan-ban/perft_gpu's ShallowHashEntry.)
+// -------------------------------------------------------------------------
+
+static const uint64 SHALLOW_PERFT_MASK = (1ULL << 24) - 1;        // 0x0000_0000_00FFFFFF
+static const uint64 SHALLOW_VERIF_MASK = ~SHALLOW_PERFT_MASK;      // 0xFFFF_FFFFFF_000000
+
+struct ShallowTT
+{
+    uint64 *entries;    // each = (hash.lo & VERIF_MASK) | (count & PERFT_MASK)
+    uint64 mask;        // numEntries - 1; numEntries must be ≥ 2²⁴ and a power of 2
+};
+
+inline bool shallowProbe(const ShallowTT &tt, Hash128 hash, uint64 *outCount)
+{
+    if (!tt.entries) return false;
+    uint64 idx   = hash.lo & tt.mask;
+    uint64 entry = tt.entries[idx];
+    if ((entry & SHALLOW_VERIF_MASK) == (hash.lo & SHALLOW_VERIF_MASK))
+    {
+        *outCount = entry & SHALLOW_PERFT_MASK;
+        return true;
+    }
+    return false;
+}
+
+inline void shallowStore(const ShallowTT &tt, Hash128 hash, uint64 count)
+{
+    if (!tt.entries) return;
+    uint64 idx = hash.lo & tt.mask;
+    tt.entries[idx] = (hash.lo & SHALLOW_VERIF_MASK) | (count & SHALLOW_PERFT_MASK);
+}
+
+// -------------------------------------------------------------------------
 // Legacy lossless chained TT (kept for reference / fallback experiments).
 // No entry is ever evicted — 128-bit Zobrist makes collisions negligible.
 // -------------------------------------------------------------------------
@@ -145,11 +185,14 @@ inline void losslessStore(LosslessTT &tt, Hash128 hash, uint64 count)
 // sized to hold all expected entries.
 #define LOSSY_TT_MAX_DEPTH 6
 
-extern TTTable     hostTTs        [MAX_TT_DEPTH];
-extern LosslessTT  hostLosslessTTs[MAX_TT_DEPTH];
+extern ShallowTT   hostShallowTT2;                 // TT[2] only (8-byte entries)
+extern TTTable     hostTTs        [MAX_TT_DEPTH];  // TT[3..LOSSY_TT_MAX_DEPTH]
+extern LosslessTT  hostLosslessTTs[MAX_TT_DEPTH];  // TT[LOSSY_TT_MAX_DEPTH+1..]
 
 inline bool perftTTProbe(int depth, Hash128 hash, uint64 *outCount)
 {
+    if (depth == 2)
+        return shallowProbe(hostShallowTT2, hash, outCount);
     if (depth <= LOSSY_TT_MAX_DEPTH)
         return ttProbe(hostTTs[depth], hash, outCount);
     return losslessProbe(hostLosslessTTs[depth], hash, outCount);
@@ -157,7 +200,9 @@ inline bool perftTTProbe(int depth, Hash128 hash, uint64 *outCount)
 
 inline void perftTTStore(int depth, Hash128 hash, uint64 count)
 {
-    if (depth <= LOSSY_TT_MAX_DEPTH)
+    if (depth == 2)
+        shallowStore(hostShallowTT2, hash, count);
+    else if (depth <= LOSSY_TT_MAX_DEPTH)
         ttStore(hostTTs[depth], hash, count);
     else
         losslessStore(hostLosslessTTs[depth], hash, count);
@@ -167,6 +212,12 @@ inline void perftTTStore(int depth, Hash128 hash, uint64 count)
 #include <emmintrin.h>
 inline void perftTTPrefetch(int depth, Hash128 hash)
 {
+    if (depth == 2 && hostShallowTT2.entries)
+    {
+        uint64 idx = hash.lo & hostShallowTT2.mask;
+        _mm_prefetch((const char *)&hostShallowTT2.entries[idx], _MM_HINT_T0);
+        return;
+    }
     if (depth <= LOSSY_TT_MAX_DEPTH && hostTTs[depth].entries)
     {
         uint64 idx = hash.lo & hostTTs[depth].mask;

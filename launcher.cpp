@@ -133,6 +133,7 @@ bool g_useTT = true;
 // host TT is thread-safe (atomic slot-bump + CAS chain prepend).
 int g_numThreads = 1;
 
+ShallowTT   hostShallowTT2 = {};                  // TT[2] only (8-byte entries)
 TTTable     hostTTs        [MAX_TT_DEPTH];
 LosslessTT  hostLosslessTTs[MAX_TT_DEPTH];
 
@@ -166,6 +167,7 @@ void initTT(int maxDepth, float branchingFactor)
 {
     memset(hostTTs,         0, sizeof(hostTTs));
     memset(hostLosslessTTs, 0, sizeof(hostLosslessTTs));
+    hostShallowTT2 = {};
     if (!g_useTT) return;
 
     // Host TTs for depths 3..maxDepth. Depth 1 doesn't recurse; depth 2 uses
@@ -175,29 +177,34 @@ void initTT(int maxDepth, float branchingFactor)
         numHostTTs++;
     if (numHostTTs == 0) return;
 
-    // TT[2] is sized independently of the BF-weighted budget below. Per-thread
-    // working set at depth 2 is dominated by recent hot positions, so cache-fit
-    // sizing matters more than capacity. Sweet spot empirically ~2 GB on this box.
+    // TT[2]: ShallowTT (8-byte entries). Half the memory of the previous 16-byte
+    // lossy entries → double effective capacity at the same RAM, with the same
+    // 64-bit hash verification (slot index encodes low 24 hash bits, entry stores
+    // high 40). Constraint: numEntries ≥ 2²⁴ so the index covers all low 24 bits.
     if (g_tt2EntriesMB > 0)
     {
-        uint64 numEntries = ((uint64)g_tt2EntriesMB * 1024 * 1024) / sizeof(TTEntry);
+        uint64 numEntries = ((uint64)g_tt2EntriesMB * 1024 * 1024) / sizeof(uint64);
         uint64 pow2 = 1;
         while (pow2 < numEntries) pow2 <<= 1;
         if (pow2 > numEntries) pow2 >>= 1;
         numEntries = pow2;
-        if (numEntries >= 1024)
+        if (numEntries < (1ULL << 24))
         {
-            TTEntry *entries = (TTEntry *)malloc(numEntries * sizeof(TTEntry));
+            printf("Warning: TT[2] size below 2^24 entries; shallow scheme would lose verification bits. Skipping.\n");
+        }
+        else
+        {
+            uint64 *entries = (uint64 *)malloc(numEntries * sizeof(uint64));
             if (entries)
             {
-                memset(entries, 0, numEntries * sizeof(TTEntry));
-                hostTTs[2].entries = entries;
-                hostTTs[2].mask = numEntries - 1;
-                uint64 totalMB = numEntries * sizeof(TTEntry) / (1024*1024);
+                memset(entries, 0, numEntries * sizeof(uint64));
+                hostShallowTT2.entries = entries;
+                hostShallowTT2.mask = numEntries - 1;
+                uint64 totalMB = numEntries * sizeof(uint64) / (1024*1024);
                 const char *unit = ""; uint64 disp = numEntries;
                 if (numEntries >= 1024*1024) { unit = "M"; disp = numEntries / (1024*1024); }
                 else if (numEntries >= 1024) { unit = "K"; disp = numEntries / 1024; }
-                printf("Host TT[2] (lossy): %llu%s entries (%llu MB)\n",
+                printf("Host TT[2] (shallow 8B): %llu%s entries (%llu MB)\n",
                        (unsigned long long)disp, unit, (unsigned long long)totalMB);
             }
         }
@@ -324,6 +331,8 @@ void initTT(int maxDepth, float branchingFactor)
 
 void freeTT()
 {
+    free(hostShallowTT2.entries);
+    hostShallowTT2 = {};
     for (int d = 0; d < MAX_TT_DEPTH; d++)
     {
         free(hostTTs[d].entries);
@@ -387,7 +396,7 @@ static uint64 perft_cpu(QuadBitBoard *pos, GameState *gs, uint32 depth, Hash128 
             GameState    childGs  [MAX_MOVES];
             Hash128      childHash[MAX_MOVES];
 
-            const TTTable &tt2 = hostTTs[2];
+            const ShallowTT &tt2 = hostShallowTT2;
 
             for (int i = 0; i < nMoves; i++)
             {
@@ -715,7 +724,17 @@ void perftCPU(QuadBitBoard *pos, GameState *gs, uint8 rootColor, uint32 depth)
 // not after every perft iteration.
 void printTTFillReport()
 {
-    for (int d = 2; d < MAX_TT_DEPTH; d++)
+    if (hostShallowTT2.entries)
+    {
+        uint64 cap = hostShallowTT2.mask + 1;
+        uint64 used = 0;
+        for (uint64 i = 0; i < cap; i++)
+            if (hostShallowTT2.entries[i]) used++;
+        double pct = 100.0 * (double)used / (double)cap;
+        printf("  TT[2] (shallow):  used %llu / %llu (%.1f%%)\n",
+               (unsigned long long)used, (unsigned long long)cap, pct);
+    }
+    for (int d = 3; d < MAX_TT_DEPTH; d++)
     {
         if (hostTTs[d].entries)
         {
