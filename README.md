@@ -43,6 +43,16 @@ Best-case wall times measured on an **Intel Core Ultra 7 270K Plus (24 threads)*
 | [Position 2](https://www.chessprogramming.org/Perft_Results#Position_2) (Kiwipete) | 7 | 374,190,009,323 | `-mt 24`, no TT, PGO | **7.48 s** | ~50.0 billion nps |
 | Starting position | 10 | 69,352,859,712,417 | `-mt 24`, TT on, non-PGO | **60.42 s** | ~1,148 billion nps |
 
+And on an **AMD Ryzen 9 9950X3D (16 cores / 32 threads)**:
+
+| Position | Depth | Nodes | Configuration | Time | Speed |
+|---|---|---|---|---|---|
+| [Position 2](https://www.chessprogramming.org/Perft_Results#Position_2) (Kiwipete) | 5 | 193,690,690 | single-thread, no TT, PGO | **71.0 ms** | ~2.73 billion nps |
+| [Position 2](https://www.chessprogramming.org/Perft_Results#Position_2) (Kiwipete) | 7 | 374,190,009,323 | `-mt 32`, no TT, PGO | **8.43 s** | ~44.4 billion nps |
+| Starting position | 10 | 69,352,859,712,417 | `-mt 32`, TT on, non-PGO | **62.80 s** | ~1,104 billion nps |
+
+The 9950X3D edges out the Intel chip on the single-threaded leaf benchmark but trails it on the multi-threaded ones — with only 16 physical cores vs the Intel's 24, `-mt 32` is 2× SMT-oversubscribed and the per-thread contention outweighs the per-thread perf advantage.
+
 ### PGO note
 
 PGO (`-DPERFT_PGO=USE` after a `GEN` + training cycle) helps the **no-TT** raw-move-generation runs by ~5–7 %, but **hurts** the TT-heavy long runs (perft 10 with TT on regresses by ~7 % vs the non-PGO build). The whole-program inliner ends up over-fitting to whatever workload it was trained on — and it's impractical to PGO-train on the larger TT-on workloads we actually care about (a perft 10 training pass would take many minutes per cycle). The default non-PGO configuration is the right choice for the TT-on case.
