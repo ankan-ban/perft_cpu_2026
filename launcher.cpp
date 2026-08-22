@@ -4,9 +4,6 @@
 #include <thread>
 #include <atomic>
 #include <vector>
-#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
-  #include <emmintrin.h>  // _mm_prefetch
-#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -412,7 +409,7 @@ static uint64 perft_cpu(QuadBitBoard *pos, GameState *gs, uint32 depth, Hash128 
                 if (tt2.entries)
                 {
                     uint64 idx = childHash[i].lo & tt2.mask;
-                    _mm_prefetch((const char *)&tt2.entries[idx], _MM_HINT_T0);
+                    PERFT_PREFETCH(&tt2.entries[idx]);
                 }
             }
 

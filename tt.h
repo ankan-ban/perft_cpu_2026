@@ -230,28 +230,34 @@ inline void perftTTStore(int depth, Hash128 hash, uint64 count)
         losslessStore(hostLosslessTTs[depth], hash, count);
 }
 
+// Portable single-line prefetch to L1 (temporal). The TT[2] probe is the top
+// profile hotspot at depth 3 and almost always misses cache, so this matters on
+// every target -- it used to be compiled out on anything but x86.
+#ifndef PERFT_PREFETCH          // -DPERFT_PREFETCH(p)=((void)0) to A/B test it away
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
-#include <emmintrin.h>
+  #include <emmintrin.h>
+  #define PERFT_PREFETCH(p) _mm_prefetch((const char *)(p), _MM_HINT_T0)
+#elif defined(__GNUC__) || defined(__clang__)
+  #define PERFT_PREFETCH(p) __builtin_prefetch((const void *)(p), 0, 3)
+#elif defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+  #include <intrin.h>
+  #define PERFT_PREFETCH(p) __prefetch((const void *)(p))
+#else
+  #define PERFT_PREFETCH(p) ((void)0)
+#endif
+#endif
+
 inline void perftTTPrefetch(int depth, Hash128 hash)
 {
     if (depth == 2 && hostShallowTT2.entries)
     {
         uint64 idx = hash.lo & hostShallowTT2.mask;
-        _mm_prefetch((const char *)&hostShallowTT2.entries[idx], _MM_HINT_T0);
+        PERFT_PREFETCH(&hostShallowTT2.entries[idx]);
         return;
     }
     if (depth <= LOSSY_TT_MAX_DEPTH && hostTTs[depth].entries)
     {
         uint64 idx = hash.lo & hostTTs[depth].mask;
-        _mm_prefetch((const char *)&hostTTs[depth].entries[idx], _MM_HINT_T0);
+        PERFT_PREFETCH(&hostTTs[depth].entries[idx]);
     }
 }
-#else
-inline void perftTTPrefetch(int, Hash128) {}
-#endif
-
-// Initialize TTs for the given max depth and average branching factor.
-void initTT(int maxDepth, float branchingFactor);
-
-// Free all TT memory.
-void freeTT();
