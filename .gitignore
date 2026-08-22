@@ -169,3 +169,9 @@ CLAUDE.md
 # CMake build directories and built binaries
 build*/
 *.exe
+
+# Build outputs
+perft_cpu
+perft_cpu_pgo
+perft_cpu_pgo_gen
+build/
