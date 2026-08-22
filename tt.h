@@ -50,23 +50,44 @@ inline void ttStore(const TTTable &tt, Hash128 hash, uint64 count)
 }
 
 // -------------------------------------------------------------------------
-// Shallow TT — 8-byte entry, used for TT[2] where the perft count fits in
-// 24 bits (depth-2 max ≈ 218×218 ≈ 47K). Packs (high 40 bits of hash) | (24
-// bits of perft) into a single uint64. With table size ≥ 2²⁴, the slot
-// index implicitly verifies the low 24 hash bits, so the high-40 stored
-// portion completes 64-bit hash verification — no collision detection lost
-// vs the 16-byte TTEntry, at half the memory. Aligned-uint64 reads/writes
-// are atomic on x86, so no torn-read concerns under MT.
-// (Idea: ankan-ban/perft_gpu's ShallowHashEntry.)
+// Shallow TT — 8-byte entry, used for TT[2].
+//
+// Layout: (high 48 bits of hash.hi) | (16-bit perft count)
+//   slot index = hash.lo & mask     -> implicitly verifies log2(N) bits of hash.lo
+//   stored verifier = hash.hi[63:16] -> 48 bits, fully INDEPENDENT of the index
+//
+// The independence matters. The previous layout stored hash.lo[63:24] as the
+// verifier while indexing with hash.lo & mask, so index and verifier overlapped:
+// a probe landing on an occupied slot had only 64 - log2(N) bits left to reject a
+// foreign entry (36 bits at the default 2^28 entries). At deep-perft probe counts
+// that yields false hits — the sister perft_gpu_2026 repo measured startpos perft
+// 12 returning 62854969240506188 instead of 62854969236701747 with the equivalent
+// scheme, and disabled it. Sourcing the verifier from the OTHER hash word instead
+// gives a flat 48 rejection bits at any table size (4096x stronger here) for the
+// same 8 bytes and the same single load/store.
+//
+// The count needs only 16 bits: a position has at most 218 legal moves, so
+// perft(2) <= 218*218 = 47524 < 2^16. shallowStore guards the bound anyway.
+//
+// A zero word means "empty". A foreign probe whose hash.hi[63:16] is all zero
+// therefore reads an empty slot as a hit with count 0; that is a 2^-48 event per
+// probe (~1e-4 over a full perft 12) and is the only residual false-hit path.
+// Aligned uint64 reads/writes are atomic, so no torn-read concerns under MT.
 // -------------------------------------------------------------------------
 
-static const uint64 SHALLOW_PERFT_MASK = (1ULL << 24) - 1;        // 0x0000_0000_00FFFFFF
-static const uint64 SHALLOW_VERIF_MASK = ~SHALLOW_PERFT_MASK;      // 0xFFFF_FFFFFF_000000
+static const uint64 SHALLOW_PERFT_MASK = (1ULL << 16) - 1;         // 0x0000_0000_0000_FFFF
+static const uint64 SHALLOW_VERIF_MASK = ~SHALLOW_PERFT_MASK;      // 0xFFFF_FFFF_FFFF_0000
+
+// verifier bits for a position: top 48 bits of hash.hi, aligned to bits [63:16]
+static CPU_FORCE_INLINE uint64 shallowVerif(Hash128 hash)
+{
+    return hash.hi & SHALLOW_VERIF_MASK;
+}
 
 struct ShallowTT
 {
-    uint64 *entries;    // each = (hash.lo & VERIF_MASK) | (count & PERFT_MASK)
-    uint64 mask;        // numEntries - 1; numEntries must be ≥ 2²⁴ and a power of 2
+    uint64 *entries;    // each = (hash.hi & VERIF_MASK) | (count & PERFT_MASK)
+    uint64 mask;        // numEntries - 1 (power of 2; any size is verification-safe)
 };
 
 inline bool shallowProbe(const ShallowTT &tt, Hash128 hash, uint64 *outCount)
@@ -74,7 +95,7 @@ inline bool shallowProbe(const ShallowTT &tt, Hash128 hash, uint64 *outCount)
     if (!tt.entries) return false;
     uint64 idx   = hash.lo & tt.mask;
     uint64 entry = tt.entries[idx];
-    if ((entry & SHALLOW_VERIF_MASK) == (hash.lo & SHALLOW_VERIF_MASK))
+    if ((entry & SHALLOW_VERIF_MASK) == shallowVerif(hash))
     {
         *outCount = entry & SHALLOW_PERFT_MASK;
         return true;
@@ -85,8 +106,9 @@ inline bool shallowProbe(const ShallowTT &tt, Hash128 hash, uint64 *outCount)
 inline void shallowStore(const ShallowTT &tt, Hash128 hash, uint64 count)
 {
     if (!tt.entries) return;
+    if (count > SHALLOW_PERFT_MASK) return;   // unreachable at depth 2 (max 47524)
     uint64 idx = hash.lo & tt.mask;
-    tt.entries[idx] = (hash.lo & SHALLOW_VERIF_MASK) | (count & SHALLOW_PERFT_MASK);
+    tt.entries[idx] = shallowVerif(hash) | count;
 }
 
 // -------------------------------------------------------------------------

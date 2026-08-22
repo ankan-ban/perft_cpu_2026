@@ -178,9 +178,9 @@ void initTT(int maxDepth, float branchingFactor)
     if (numHostTTs == 0) return;
 
     // TT[2]: ShallowTT (8-byte entries). Half the memory of the previous 16-byte
-    // lossy entries → double effective capacity at the same RAM, with the same
-    // 64-bit hash verification (slot index encodes low 24 hash bits, entry stores
-    // high 40). Constraint: numEntries ≥ 2²⁴ so the index covers all low 24 bits.
+    // lossy entries → double effective capacity at the same RAM. The entry stores
+    // a 48-bit verifier taken from hash.hi while the slot index comes from hash.lo,
+    // so verification strength (48 independent bits) does not depend on table size.
     if (g_tt2EntriesMB > 0)
     {
         uint64 numEntries = ((uint64)g_tt2EntriesMB * 1024 * 1024) / sizeof(uint64);
@@ -188,9 +188,9 @@ void initTT(int maxDepth, float branchingFactor)
         while (pow2 < numEntries) pow2 <<= 1;
         if (pow2 > numEntries) pow2 >>= 1;
         numEntries = pow2;
-        if (numEntries < (1ULL << 24))
+        if (numEntries < (1ULL << 16))
         {
-            printf("Warning: TT[2] size below 2^24 entries; shallow scheme would lose verification bits. Skipping.\n");
+            printf("Warning: TT[2] size below 2^16 entries. Skipping.\n");
         }
         else
         {
