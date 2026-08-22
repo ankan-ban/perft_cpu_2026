@@ -1553,6 +1553,16 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         int bufN_slow;
         uint64 partialSum;
         uint64 cachedNonSliderAtk;
+#if USE_NULL_COUNT_DEPTH2
+        // Depth-2 null-count reuse (see buildNullMasks).
+        uint64 npOcc;          // squares whose occupancy can change O's own moves
+        uint64 npLines;        // squares on a slider line to O's king ring (+ pin x-rays)
+        uint64 npKnightPre;    // squares from which a knight attacks the ring
+        uint64 npKingPre;      // ... a king
+        uint64 npPawnPre;      // ... an M pawn
+        uint32 npNullCount;    // O's reply count on the unchanged board
+        bool   npEnabled;
+#endif
         // E9: leaf's myKing is parent's opp-side king. parent never moves the
         // opp-side pieces, so this is invariant across the entire enumeration.
         // Hoist to avoid `kings = ...; myKing = kings & myPieces; bitScan(myKing)`
@@ -1584,7 +1594,130 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
             else
                 pawnAtk = southEastOne(myPawns) | southWestOne(myPawns);
             cachedNonSliderAtk = pawnAtk | knightAttacks(myKnights) | kingAttacks(myKing);
+#if USE_NULL_COUNT_DEPTH2
+            buildNullMasks(all, oppPieces, allPawns, knights, myKing);
+#endif
         }
+
+#if USE_NULL_COUNT_DEPTH2
+        static CPU_FORCE_INLINE uint64 bishopAtkOcc(uint8 sq, uint64 occ) noexcept
+        {
+            uint64 o = occ & sqBishopAttacksMasked(sq);
+            return bishop_magic_tables[sq][(bishop_magic_factors[sq] * o) >> (64 - BISHOP_MAGIC_BITS)];
+        }
+        static CPU_FORCE_INLINE uint64 rookAtkOcc(uint8 sq, uint64 occ) noexcept
+        {
+            uint64 o = occ & sqRookAttacksMasked(sq);
+            return rook_magic_tables[sq][(rook_magic_factors[sq] * o) >> (64 - ROOK_MAGIC_BITS)];
+        }
+
+        // Depth-2 null-move count reuse (idea: MPerft / chessbit via sister repo
+        // perft_gpu_2026 commit 8f9bde2).
+        //
+        // Let M = the mover (parentChance) and O = the replier. The "null" count
+        //     N = countMoves<O>(parent board, EP cleared)
+        // is O's reply count if M could pass. For a child move f->t, the reply
+        // count still equals N whenever the move provably leaves O's legal move
+        // set untouched -- then the child needs no makeMove and no leaf count at
+        // all, just `sum += N`.
+        //
+        // A move is harmless when it is a quiet move (flags == 0 rules out
+        // captures-with-flags, promotions, castling, EP capture, and double pushes
+        // which would hand O an EP capture) AND neither f nor t is in any of:
+        //
+        //   npOcc   occupancy-sensitive squares for O's OWN pieces:
+        //             oppPieces  - t here means a capture: O loses a piece
+        //             sl         - O's slider attack set: filling t truncates a ray,
+        //                          vacating f extends one
+        //             pw         - O's pawn push (1 and 2 step) and capture squares,
+        //                          where occupancy flips a pawn move on or off
+        //             ringExt    - O's king ring plus its castle corridors, where
+        //                          occupancy decides king/castling moves
+        //   npLines squares on a slider line to the ring: filling t blocks an M
+        //           slider that bears on the ring, vacating f discovers one, and a
+        //           moved slider landing on t may newly bear on the ring. Attack
+        //           sets are symmetric under a fixed occupancy, so the set of
+        //           squares from which a bishop attacks r is bishopAttacks(r, occ).
+        //           Pins are relative to the king square alone, so one level of
+        //           x-ray from there covers pins created and broken.
+        //   npKnightPre / npKingPre / npPawnPre: the same "does the moved piece
+        //           itself bear on the ring" test for the non-slider piece types.
+        //
+        // Guard: if M is in check, the null board would let O capture M's king, so
+        // N is not a valid reply count. Disable the reuse for that parent.
+        CPU_FORCE_INLINE void buildNullMasks(uint64 all, uint64 oppPieces, uint64 allPawns,
+                                             uint64 knights, uint64 myKing) noexcept
+        {
+            uint64 bishopQueens = parent.bb[1] & (parent.bb[2] ^ parent.bb[3]);
+            uint64 rookQueens   = parent.bb[3] & ~parent.bb[2];
+            uint64 oPawns   = allPawns     & oppPieces;
+            uint64 oKnights = knights      & oppPieces;
+            uint64 oBishops = bishopQueens & oppPieces;
+            uint64 oRooks   = rookQueens   & oppPieces;
+            uint64 oKing    = leafMyKing;
+            uint8  oKingIdx = bitScan(oKing);
+
+            uint64 sl = 0, sliders = oBishops;
+            while (sliders) { uint8 q = bitScan(sliders); sl |= bishopAtkOcc(q, all); sliders &= sliders - 1; }
+            sliders = oRooks;
+            while (sliders) { uint8 q = bitScan(sliders); sl |= rookAtkOcc(q, all);   sliders &= sliders - 1; }
+
+            uint64 oPawnAtk, pw;
+            if constexpr (parentChance == WHITE) {          // O is BLACK, pushes south
+                uint64 p1 = southOne(oPawns);
+                oPawnAtk = southEastOne(oPawns) | southWestOne(oPawns);
+                pw = oPawnAtk | p1 | southOne(p1);
+            } else {
+                uint64 p1 = northOne(oPawns);
+                oPawnAtk = northEastOne(oPawns) | northWestOne(oPawns);
+                pw = oPawnAtk | p1 | northOne(p1);
+            }
+
+            uint64 oAtk = sl | oPawnAtk | knightAttacks(oKnights) | kingAttacks(oKing);
+            npEnabled = (oAtk & myKing) == 0;
+            if (!npEnabled) return;
+
+            uint64 ringExt = sqKingAttacks(oKingIdx) | oKing;
+            uint64 occExtra = 0;
+            uint8 oCastle = (parentChance == WHITE) ? parentGs.blackCastle : parentGs.whiteCastle;
+            if (oCastle) [[unlikely]]
+            {
+                if constexpr (parentChance == WHITE) {
+                    if (oCastle & CASTLE_FLAG_KING_SIDE)  { ringExt |= BIT(F8) | BIT(G8); occExtra |= BIT(F8) | BIT(G8); }
+                    if (oCastle & CASTLE_FLAG_QUEEN_SIDE) { ringExt |= BIT(C8) | BIT(D8); occExtra |= BIT(B8) | BIT(C8) | BIT(D8); }
+                } else {
+                    if (oCastle & CASTLE_FLAG_KING_SIDE)  { ringExt |= BIT(F1) | BIT(G1); occExtra |= BIT(F1) | BIT(G1); }
+                    if (oCastle & CASTLE_FLAG_QUEEN_SIDE) { ringExt |= BIT(C1) | BIT(D1); occExtra |= BIT(B1) | BIT(C1) | BIT(D1); }
+                }
+            }
+            npOcc = oppPieces | sl | pw | ringExt | occExtra;
+
+            uint64 lines = 0, sqs = ringExt;
+            while (sqs)
+            {
+                uint8 r = bitScan(sqs);
+                lines |= bishopAtkOcc(r, all) | rookAtkOcc(r, all);
+                sqs &= sqs - 1;
+            }
+            uint64 b  = bishopAtkOcc(oKingIdx, all);
+            uint64 rk = rookAtkOcc  (oKingIdx, all);
+            lines |= bishopAtkOcc(oKingIdx, all ^ (b  & all));   // pin x-ray, king square only
+            lines |= rookAtkOcc  (oKingIdx, all ^ (rk & all));
+            npLines = lines;
+
+            npKnightPre = knightAttacks(ringExt);
+            npKingPre   = kingAttacks(ringExt);
+            if constexpr (parentChance == WHITE)
+                npPawnPre = southEastOne(ringExt) | southWestOne(ringExt);
+            else
+                npPawnPre = northEastOne(ringExt) | northWestOne(ringExt);
+
+            QuadBitBoard np = parent;
+            GameState    ng = parentGs;
+            ng.enPassent = 0;
+            npNullCount = countMoves<(uint8)(parentChance ^ 1)>(&np, &ng);
+        }
+#endif
 
         // Drain a full buffer mid-enumeration. A position can have up to 218
         // legal moves, all of which may land in the same buffer, so BUF_CAP is
@@ -1613,6 +1746,20 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         CPU_FORCE_INLINE void emit(uint8 from, uint8 to, uint8 flags)
         {
             constexpr bool isSliderEmit = (piece == BISHOP || piece == ROOK || piece == QUEEN);
+#if USE_NULL_COUNT_DEPTH2
+            if (npEnabled && flags == CM_FLAG_QUIET_MOVE)
+            {
+                uint64 mask = npOcc | npLines;
+                if      constexpr (piece == KNIGHT) mask |= npKnightPre;
+                else if constexpr (piece == KING)   mask |= npKingPre;
+                else if constexpr (piece == PAWN)   mask |= npPawnPre;
+                if (!((BIT(from) | BIT(to)) & mask))
+                {
+                    partialSum += npNullCount;   // reply set provably unchanged
+                    return;
+                }
+            }
+#endif
             QuadBitBoard *cp;
             GameState    *cgs;
             if constexpr (isSliderEmit) {
