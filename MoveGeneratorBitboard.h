@@ -1533,6 +1533,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         GameState parentGs;
         int bufN_fast;
         int bufN_slow;
+        uint64 partialSum;
         uint64 cachedNonSliderAtk;
         // E9: leaf's myKing is parent's opp-side king. parent never moves the
         // opp-side pieces, so this is invariant across the entire enumeration.
@@ -1545,7 +1546,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         GameState               bufGs_slow[BUF_CAP];
 
         CPU_FORCE_INLINE FgmcCount2Processor(const QuadBitBoard &p, const GameState &pgs) noexcept
-            : parent(p), parentGs(pgs), bufN_fast(0), bufN_slow(0)
+            : parent(p), parentGs(pgs), bufN_fast(0), bufN_slow(0), partialSum(0)
         {
             uint64 all          = parent.bb[1] | parent.bb[2] | parent.bb[3];
             uint64 blackPieces  = parent.bb[0];
@@ -1567,6 +1568,29 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
             cachedNonSliderAtk = pawnAtk | knightAttacks(myKnights) | kingAttacks(myKing);
         }
 
+        // Drain a full buffer mid-enumeration. A position can have up to 218
+        // legal moves, all of which may land in the same buffer, so BUF_CAP is
+        // an optimization knob, not a correctness assumption.
+        CPU_FORCE_INLINE void drainFast() noexcept
+        {
+            constexpr uint8 leafChance = (uint8)(parentChance ^ 1);
+            if constexpr (leafChance == WHITE)
+                partialSum += countMovesBulkAVX2_fast_white(bufCp_fast, bufGs_fast, bufN_fast, cachedNonSliderAtk);
+            else
+                partialSum += countMovesBulkAVX2_fast_black(bufCp_fast, bufGs_fast, bufN_fast, cachedNonSliderAtk);
+            bufN_fast = 0;
+        }
+
+        CPU_FORCE_INLINE void drainSlow() noexcept
+        {
+            constexpr uint8 leafChance = (uint8)(parentChance ^ 1);
+            if constexpr (leafChance == WHITE)
+                partialSum += countMovesBulkAVX2_slow_white(bufCp_slow, bufGs_slow, bufN_slow);
+            else
+                partialSum += countMovesBulkAVX2_slow_black(bufCp_slow, bufGs_slow, bufN_slow);
+            bufN_slow = 0;
+        }
+
         template <uint8 piece>
         CPU_FORCE_INLINE void emit(uint8 from, uint8 to, uint8 flags)
         {
@@ -1574,10 +1598,12 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
             QuadBitBoard *cp;
             GameState    *cgs;
             if constexpr (isSliderEmit) {
+                if (bufN_fast == BUF_CAP) [[unlikely]] drainFast();
                 int i = bufN_fast++;
                 cp  = &bufCp_fast[i];
                 cgs = &bufGs_fast[i];
             } else {
+                if (bufN_slow == BUF_CAP) [[unlikely]] drainSlow();
                 int i = bufN_slow++;
                 cp  = &bufCp_slow[i];
                 cgs = &bufGs_slow[i];
@@ -1608,7 +1634,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         CPU_FORCE_INLINE uint64 flush()
         {
             constexpr uint8 leafChance = (uint8)(parentChance ^ 1);
-            uint64 s = 0;
+            uint64 s = partialSum;
             if constexpr (leafChance == WHITE) {
                 s += countMovesBulkAVX2_fast_white(bufCp_fast, bufGs_fast, bufN_fast, cachedNonSliderAtk);
                 s += countMovesBulkAVX2_slow_white(bufCp_slow, bufGs_slow, bufN_slow);
