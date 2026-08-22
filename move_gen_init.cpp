@@ -42,6 +42,39 @@ void MoveGeneratorBitboard::init()
             Line[i][j] = squaresInLine(i, j);
         }
 
+    // King-zone slider prefilter LUTs. For king square k, collect every square
+    // from which a bishop/rook could reach k's 3x3 neighbourhood on an empty
+    // board. Occupancy only ever blocks rays, so this is a superset for every
+    // real position and the prefilter can never drop a relevant slider.
+    for (uint8 k = 0; k < 64; k++)
+    {
+        uint64 nb = KingAttacks[k] | BIT(k);   // 3x3 neighbourhood incl. the king
+        uint64 zd = nb, zo = nb;
+        uint64 sqs = nb;
+        while (sqs)
+        {
+            uint8 si = bitScan(sqs);
+            zd |= BishopAttacks[si];
+            zo |= RookAttacks[si];
+            sqs &= sqs - 1;
+        }
+        KingZoneDiag [k] = zd;
+        KingZoneOrtho[k] = zo;
+    }
+    // Castling also tests `threatened` on the corridor squares, which lie outside
+    // the king's 3x3 box. Castling rights imply the king is still on E1/E8, so
+    // folding the corridors into those two entries covers every such test.
+    {
+        const uint8 corridors[] = { C1, D1, F1, G1, C8, D8, F8, G8 };
+        for (uint8 i = 0; i < 8; i++)
+        {
+            uint8 sq = corridors[i];
+            uint8 k  = (i < 4) ? (uint8)E1 : (uint8)E8;
+            KingZoneDiag [k] |= BishopAttacks[sq] | BIT(sq);
+            KingZoneOrtho[k] |= RookAttacks  [sq] | BIT(sq);
+        }
+    }
+
     // Magic occupancy masks (excluding edge squares)
     for (int square = A1; square <= H8; square++)
     {

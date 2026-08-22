@@ -12,6 +12,8 @@ uint64 BishopAttacks  [64];
 uint64 QueenAttacks   [64];
 uint64 KingAttacks    [64];
 uint64 KnightAttacks  [64];
+uint64 KingZoneDiag   [64];
+uint64 KingZoneOrtho  [64];
 uint64 pawnAttacks[2] [64];
 
 // same as RookAttacks and BishopAttacks, but corner bits masked off

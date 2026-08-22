@@ -122,6 +122,11 @@ extern uint64 BishopAttacks  [64];
 extern uint64 QueenAttacks   [64];
 extern uint64 KingAttacks    [64];
 extern uint64 KnightAttacks  [64];
+// King-zone slider prefilter LUTs: for king square k, the set of squares from
+// which a bishop/rook could reach k's 3x3 neighbourhood on an EMPTY board (a
+// superset of any occupied board). Castle corridors are folded into E1/E8.
+extern uint64 KingZoneDiag   [64];
+extern uint64 KingZoneOrtho  [64];
 extern uint64 pawnAttacks[2] [64];
 
 // magic lookup tables
@@ -175,6 +180,8 @@ CPU_FORCE_INLINE uint64 sqRookAttacks  (uint8 sq)             { return RookAttac
 CPU_FORCE_INLINE uint64 sqBishopAttacks(uint8 sq)             { return BishopAttacks[sq]; }
 CPU_FORCE_INLINE uint64 sqBishopAttacksMasked(uint8 sq)       { return BishopAttacksMasked[sq]; }
 CPU_FORCE_INLINE uint64 sqRookAttacksMasked  (uint8 sq)       { return RookAttacksMasked  [sq]; }
+CPU_FORCE_INLINE uint64 sqKingZoneDiag (uint8 sq)             { return KingZoneDiag [sq]; }
+CPU_FORCE_INLINE uint64 sqKingZoneOrtho(uint8 sq)             { return KingZoneOrtho[sq]; }
 
 // Plan A AVX2 leaf-batch entry points (defined in leaf_batch_avx2.cpp,
 // compiled /arch:AVX2 /GL- in isolation). Phase 1: stubs that loop the
@@ -722,12 +729,14 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
     // parent move was a slider). The X-ray-through-my-king behaviour for sliders
     // is preserved.
     CPU_FORCE_INLINE static uint64 findSliderAttacksOnly(
-        uint64 emptySquares, uint64 enemyBishops, uint64 enemyRooks, uint64 myKing)
+        uint64 emptySquares, uint64 enemyBishops, uint64 enemyRooks, uint64 myKing,
+        uint8 myKingIndex)
     {
         uint64 attacked = 0;
         uint64 sliderOcc = ~(emptySquares | myKing);
 
-        uint64 sliders = enemyBishops;
+        // King-zone prefilter: see findAttackedSquares.
+        uint64 sliders = enemyBishops & sqKingZoneDiag(myKingIndex);
         #pragma loop(ivdep)
         while (sliders)
         {
@@ -738,7 +747,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
             sliders &= sliders - 1;
         }
 
-        sliders = enemyRooks;
+        sliders = enemyRooks & sqKingZoneOrtho(myKingIndex);
         #pragma loop(ivdep)
         while (sliders)
         {
@@ -903,7 +912,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
     // TODO: maybe make this tempelated on color?
     CPU_FORCE_INLINE static uint64 findAttackedSquares(uint64 emptySquares, uint64 enemyBishops, uint64 enemyRooks,
                                       uint64 enemyPawns, uint64 enemyKnights, uint64 enemyKing,
-                                      uint64 myKing, uint8 enemyColor)
+                                      uint64 myKing, uint8 enemyColor, uint8 myKingIndex)
     {
         // E28: enemy king always exactly one bit; my king too. Helps MSVC
         // generate tighter slider iteration.
@@ -934,10 +943,19 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         // already-negated occupancy. (E15)
         uint64 sliderOcc = ~(emptySquares | myKing);
 
+        // King-zone prefilter (idea from sister repo perft_gpu_2026, cf33acd):
+        // `attacked` is only ever consumed at king-local squares — the check test
+        // (threatened & myKing), the king-ring filter (kingMoves &= ~threatened),
+        // and the castle-corridor tests, whose squares are folded into the E1/E8
+        // zone entries. A slider outside the zone cannot reach any of those squares
+        // under ANY occupancy, because the zone is the empty-board superset of the
+        // squares that attack the king's 3x3 neighbourhood. So skip its magic
+        // lookup entirely.
+        //
         // E20: bitScan(sliders) directly + BLSR clear — skips the
         // getOne (NEG+AND) per iter. The result is the index of the lowest
         // set bit either way.
-        uint64 sliders = enemyBishops;
+        uint64 sliders = enemyBishops & sqKingZoneDiag(myKingIndex);
 #pragma loop(ivdep)
         while (sliders)
         {
@@ -948,7 +966,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
             sliders &= sliders - 1;
         }
 
-        sliders = enemyRooks;
+        sliders = enemyRooks & sqKingZoneOrtho(myKingIndex);
 #pragma loop(ivdep)
         while (sliders)
         {
@@ -1215,7 +1233,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
 
         uint64 threatened = findAttackedSquares(~allPieces, enemyBishops, enemyRooks, allPawns & enemyPieces,
                                                 knights & enemyPieces, kings & enemyPieces,
-                                                myKing, !chance);
+                                                myKing, !chance, kingIndex);
 
         // king is in check: call special generate function to generate only the moves that take king out of check
         if (threatened & myKing)
@@ -2122,7 +2140,7 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
 
         uint64 threatened = findAttackedSquares(~allPieces, enemyBishops, enemyRooks, allPawns & enemyPieces,
                                                 knights & enemyPieces, kings & enemyPieces,
-                                                myKing, !chance);
+                                                myKing, !chance, kingIndex);
 
         // king is in check (uncommon — most leaves are quiet positions)
         if (threatened & myKing) [[unlikely]]
@@ -2226,9 +2244,9 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         // Slider-only attack computation, OR'd with the cached non-slider attacks
         // and the recomputed moved-piece-type's attacks.
         uint64 threatA = cachedNonSliderAtk | extraAtkA |
-                         findSliderAttacksOnly(~allPiecesA, enemyBishopsA, enemyRooksA, myKingA);
+                         findSliderAttacksOnly(~allPiecesA, enemyBishopsA, enemyRooksA, myKingA, kingIndexA);
         uint64 threatB = cachedNonSliderAtk | extraAtkB |
-                         findSliderAttacksOnly(~allPiecesB, enemyBishopsB, enemyRooksB, myKingB);
+                         findSliderAttacksOnly(~allPiecesB, enemyBishopsB, enemyRooksB, myKingB, kingIndexB);
 
         uint64 sum = 0;
         {
@@ -2455,8 +2473,8 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         // pressure cost ~2 ms more than two clean back-to-back calls. The pair
         // function still wins from function-call amortization and from giving
         // MSVC's OoO scheduler a single hot frame instead of two.
-        uint64 threatA = findAttackedSquares(~allPiecesA, enemyBishopsA, enemyRooksA, allPawnsA & enemyPiecesA, knightsA & enemyPiecesA, kingsA & enemyPiecesA, myKingA, !chance);
-        uint64 threatB = findAttackedSquares(~allPiecesB, enemyBishopsB, enemyRooksB, allPawnsB & enemyPiecesB, knightsB & enemyPiecesB, kingsB & enemyPiecesB, myKingB, !chance);
+        uint64 threatA = findAttackedSquares(~allPiecesA, enemyBishopsA, enemyRooksA, allPawnsA & enemyPiecesA, knightsA & enemyPiecesA, kingsA & enemyPiecesA, myKingA, !chance, kingIndexA);
+        uint64 threatB = findAttackedSquares(~allPiecesB, enemyBishopsB, enemyRooksB, allPawnsB & enemyPiecesB, knightsB & enemyPiecesB, kingsB & enemyPiecesB, myKingB, !chance, kingIndexB);
 
         // Per-child pinned + dispatch.
         uint64 sum = 0;
@@ -2560,8 +2578,8 @@ CPU_FORCE_INLINE static uint64 multiKnightAttacks(uint64 knights)
         uint8 kingIndexB = bitScan(myKingB);
 
         // Slider-only attacks, OR'd with the SIMD-precomputed non-slider attacks.
-        uint64 threatA = nonSliderAtkA | findSliderAttacksOnly(~allPiecesA, enemyBishopsA, enemyRooksA, myKingA);
-        uint64 threatB = nonSliderAtkB | findSliderAttacksOnly(~allPiecesB, enemyBishopsB, enemyRooksB, myKingB);
+        uint64 threatA = nonSliderAtkA | findSliderAttacksOnly(~allPiecesA, enemyBishopsA, enemyRooksA, myKingA, kingIndexA);
+        uint64 threatB = nonSliderAtkB | findSliderAttacksOnly(~allPiecesB, enemyBishopsB, enemyRooksB, myKingB, kingIndexB);
 
         uint64 sum = 0;
         {
